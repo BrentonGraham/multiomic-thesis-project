@@ -1,0 +1,546 @@
+---
+title: "Multiomics Exploration for Project 883"
+author: "Brenton Graham"
+date: "2023-03-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(phyloseq)
+require(microbiome)
+require(ade4)
+require(PMA)
+require(vegan)
+require(ggrepel)
+require(scales)
+require(ggpubr)
+require(compositions)
+require(reshape2)
+require(vegan)
+require(ggdendro)
+```
+
+```{r}
+roll_to_genus <- function(physeq) {
+
+  tax_and_otu_df <- merge(
+      physeq %>% tax_table() %>% as.data.frame(),
+      physeq %>% otu_table() %>% as.data.frame(), 
+      by = 'row.names') %>%
+    column_to_rownames('Row.names')
+  
+  output_df <- tax_and_otu_df %>% filter(is.na(Genus)) %>% dplyr::select(-Species)
+  
+  genera <- tax_and_otu_df %>% 
+    filter(!is.na(Genus)) %>% 
+    arrange(Genus) %>% 
+    pull(Genus) %>% 
+    unique()
+  
+  for (genus in genera) {
+    
+    genus_taxonomy_cols <- tax_and_otu_df %>% 
+      filter(Genus == genus) %>% 
+      filter(is.na(Species)) %>% 
+      dplyr::select(c(Domain, Phylum, Class, Order, Family, Genus))
+    
+    genus_sum_df <- tax_and_otu_df %>% 
+      filter(Genus == genus) %>% 
+      dplyr::select(-c(Domain, Phylum, Class, Order, Family, Genus, Species)) %>% 
+      colSums() %>% t() %>% 
+      as.data.frame() %>% 
+      set_rownames(rownames(genus_taxonomy_cols))
+    
+    genus_tax_and_otu_df <-  cbind(genus_taxonomy_cols, genus_sum_df)
+    
+    output_df <- rbind(output_df, genus_tax_and_otu_df)
+    
+  }
+    
+  output_otu_table <- output_df %>% 
+    dplyr::select(-c(Domain, Phylum, Class, Order, Family, Genus)) %>%
+    as.matrix()
+  
+  output_tax_table <- output_df %>% 
+    dplyr::select(c(Domain, Phylum, Class, Order, Family, Genus)) %>%
+    as.matrix()
+  
+  output_physeq <- phyloseq(
+    otu_table(output_otu_table, taxa_are_rows=T), 
+    tax_table(output_tax_table), 
+    sample_data(physeq))
+  
+  return(output_physeq)
+
+}
+```
+
+# Data Preparation
+## Enforce Inclusion Criteria
+```{r, message=FALSE}
+# Full set mutliomics set
+data <- "/Users/bgraham/Research/883/Data/Merged Data/883MergedData.20221026.csv" %>% read_delim(delim=",")
+
+# Not in function
+`%not in%` <- Negate(`%in%`)
+
+# Select appropriate data for study
+inclusion_data <- data %>% 
+  filter(sid > 25) %>%                    # SIDs > 25
+  filter(sample_type_16S == "Sputum") %>% # Select samples with sputum sequencing data
+  filter(!is.na(proteomics_batch)) %>%    # Select samples with both microbiome/proteome data
+  filter(time != 3) %>%                   # Remove follow-up data
+  # Label T1 and T2 vars
+  mutate(time = factor(time, levels = c(1, 2), labels = c("T1", "T2"))) %>%
+  # Remove proteomics dupes
+  unite("id_and_prot_batch", c(soma_sample_id, proteomics_batch), sep = "_", remove = F) %>%
+  filter(id_and_prot_batch %not in% c("S821-364_20170126", "S821-323_20170126", "S821-276_20170126")) #%>%
+  #filter(sid != 49)
+
+# How many subjects have only 1 time point (either T1 or T2)? Both time point 1 and 2?
+tp_subject_count <- inclusion_data %>% dplyr::select(sid) %>% table() %>% table()
+# Results: 25 subjects fitting the inclusion criteria have both time point 1 & 2 data
+```
+
+## Table 1 by Time Point
+This table shows the number of subjects at time points 1 and 2.
+**Note**: Only 35 of the 38 subjects remain after calculating pes_delta due to either T1 or T2 missing values.
+```{r}
+# Table 1
+vars <- c("fev1_pred", "crp", "elastase", "pes_total")
+table1 <- CreateTableOne(vars = vars, strata = c("time"), data = inclusion_data)
+print(table1, print = F, nonnormal = T, minMax = F, contDigits = 1) %>% 
+  as.data.frame() %>% 
+  dplyr::select(-p, -test) %>% 
+  knitr::kable(align = 'ccccc')
+```
+
+## FEV-1 Outcome: Difference Between FEV-1 % Pred at T1 & T2
+Using pes_delta = fev1_pred_T2 - fev1_pred_T1
+
+```{r, message=F}
+# Get all FEV-1 data for T1 and T2 and calculate pes_delta (fev1_pred_T2 - fev1_pred_T1)
+pes_df <- data %>% 
+  filter(sid > 25) %>% 
+  filter(time != 3) %>% # Inclusion criteria
+  dplyr::select(sid, time, pes_total) %>%    # Select columns needed for calculation
+  unique() %>%                               # Drop repeat rows (FEV same for sputum/saliva samples)
+  mutate(time = factor(time, levels = c(1, 2), labels = c("pes_T1", "pes_T2"))) %>%
+  pivot_wider(names_from = time, values_from = pes_total) %>%
+  mutate(pes_delta = pes_T2 - pes_T1)
+
+# Merge outcome into data frame
+inclusion_data <- merge(inclusion_data, pes_df, all.x = T, all.y = F) %>%
+  relocate(c("pes_delta", "pes_T1", "pes_T2"), .after = pes_total)
+
+# Display histogram of FEV-1 % predicted difference 
+ggplot(inclusion_data, aes(x = pes_delta)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = "PES Delta (T2 - T1)", y = "Count") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank())
+```
+
+## Split the Data by Omic Type
+Here we're dividing the data into the separate microbiome/proteomics pieces.
+```{r}
+# Microbiome data
+microbiome_data <- inclusion_data %>% 
+  filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(soma_sample_id, contains("Bacteria/"), -contains("other"))
+# -> CSV
+#microbiome_data %>% dplyr::select(-soma_sample_id) %>% write.table("data/microbiome-otu-data.csv", sep = ",", row.names = F)
+
+# Proteomics data - write to CSV
+proteomics_data <- inclusion_data %>% 
+  filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(soma_sample_id, contains("seq"))
+# -> CSV
+#proteomics_data %>% dplyr::select(-soma_sample_id) %>% write.table("data/proteome-data.csv", sep = ",", row.names = F)
+```
+
+## CLR-Transform the Microbiome Data
+### Species Level
+```{r}
+# CLR transformation
+otu_table <- microbiome_data %>% column_to_rownames("soma_sample_id") %>% t() %>% otu_table(taxa_are_rows=T)
+metadata <- inclusion_data %>% 
+  column_to_rownames("soma_sample_id") %>% 
+  filter(time == "T1") %>% 
+  filter(!is.na(pes_delta)) %>% 
+  dplyr::select(-contains("Bacteria"), -contains("seq"))
+otu_names <- otu_table %>% as.data.frame() %>% rownames()
+tax_levels <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+otu_tax_split <- sapply(otu_names, FUN=function(x) strsplit(x, "/"))
+tax_table <- plyr::ldply(otu_tax_split, rbind)[-1] %>%
+  set_rownames(otu_names) %>%
+  set_colnames(tax_levels) %>%
+  as.matrix()
+physeq <- phyloseq(otu_table(otu_table), tax_table(tax_table), sample_data(metadata))
+physeq.filtered <- physeq %>% microbiome::transform("compositional") %>% microbiome::core(detection = 1e-3, prevalence = 10/100)
+core_taxa <- physeq.filtered %>% abundances() %>% t() %>% as.data.frame() %>% colnames()
+
+# CLR transform
+microb_rel_data <- physeq.filtered %>% abundances() %>% t() %>% as.data.frame()
+microb_clr_data <- physeq.filtered %>% microbiome::transform("clr") %>% abundances() %>% t() %>% as.data.frame()
+#microb_clr_data_2 <- physeq %>% microbiome::transform("clr") %>% abundances() %>% t() %>% as.data.frame() %>% dplyr::select(core_taxa)
+#clr_data <- microbiome_data %>% dplyr::select(-soma_sample_id) %>% dplyr::select(core_taxa) %>% acomp() %>% clr() %>% as.data.frame()
+
+#library(reshape2)
+#clr1 <- microb_clr_data %>% 
+#   dplyr::select(contains("Prevotella")) %>%
+#   melt() %>% mutate(set = "clr1")
+# 
+# clr2 <- microb_clr_data_2 %>% 
+#   dplyr::select(contains("Prevotella")) %>%
+#   melt()  %>% mutate(set = "clr2")
+# 
+# clr3 <- clr_data %>% 
+#   dplyr::select(contains("Prevotella")) %>%
+#   melt()  %>% mutate(set = "compositions")
+# 
+# rbind(clr1, clr2, clr3) %>%
+#   ggplot(aes(x = value)) +
+#   geom_density(aes(color = set), lwd = 1, alpha = 0.5) +
+#   facet_wrap(vars(variable), scales = "free", nrow = 3) +
+#   theme_bw() +
+#   theme(plot.title = element_text(hjust = 0.5))
+
+#proteomics_data %>% dplyr::select(-soma_sample_id) %>% melt() %>%
+#  ggplot() +
+#  geom_density(aes(x = log10(value)), color = "red", lwd = 1, alpha = 0.5) +
+#  geom_density(aes(x = log2(value)), color = "blue", lwd = 1, alpha = 0.5) +
+#  theme_bw()
+
+#otu_table %>% t() %>% as.data.frame() %>% write.table("./data/microbiome-otu-data-species.csv", sep = ",")
+
+```
+
+### Genus Level
+```{r}
+physeq.genus <- roll_to_genus(physeq)
+physeq.genus.filtered <- physeq.genus %>% microbiome::transform("compositional") %>% microbiome::core(detection = 1e-3, prevalence = 10/100)
+core_taxa.genus <- physeq.genus.filtered %>% abundances() %>% t() %>% as.data.frame() %>% colnames()
+microb_rel_data.genus <- physeq.genus.filtered %>% abundances() %>% t() %>% as.data.frame()
+microb_clr_data.genus <- physeq.genus.filtered %>% microbiome::transform("clr") %>% abundances() %>% t() %>% as.data.frame()
+```
+
+### Compositional Plots
+```{r}
+# Create dendrogram to order samples by similar composition
+taxa_names <- sub('.*\\/', '', colnames(microb_rel_data))
+rel_ab_df <- microb_rel_data %>%
+  set_colnames(taxa_names)
+
+# Dendrogram
+dendrogram <- rel_ab_df %>%
+  vegdist(method = "bray") %>%
+  hclust(method = "ward.D2") %>%
+  as.dendrogram() %>%
+  dendro_data(type = "rectangle")
+
+# Get x order mapped to SID
+dend_labels <- dendrogram$labels %>%
+  as.data.frame() %>%
+  mutate(rownames = label) %>%
+  column_to_rownames("rownames") %>%
+  base::merge(metadata, by = 'row.names') %>%
+  column_to_rownames("Row.names") %>%
+  mutate(sid = paste0("SID", sid)) %>% 
+  dplyr::select(x, sid)
+
+## Visualize Compositional Data
+fev1_vals <- metadata %>% dplyr::select(sid, pes_delta) %>% mutate(sid = paste0("SID", sid)) %>% remove_rownames()
+melted_rel_ab_df <- rel_ab_df %>%
+  merge(metadata %>% set_rownames(rownames(microb_clr_data)) %>% dplyr::select(sid), by = "row.names") %>%
+  column_to_rownames("Row.names") %>%
+  dplyr::select(sid, everything()) %>%
+  mutate(sid = paste0("SID", sid)) %>% 
+  melt(idvars=c(sid)) %>% 
+  dplyr::rename(taxa = variable, rel_ab = value) %>%
+  mutate(rel_ab = rel_ab * 100) %>% # Convert to out of 100
+  base::merge(fev1_vals) %>%
+  base::merge(dend_labels) %>%
+  arrange(x, taxa)
+
+# Determine top 15 most prevalent taxa
+top_taxa <- melted_rel_ab_df %>%
+  group_by(taxa) %>%
+  summarise(sum = sum(rel_ab)) %>%
+  arrange(desc(sum)) %>% ungroup() %>%
+  head(19) %>% 
+  mutate(taxa = as.character(taxa)) %>%
+  pull(taxa)
+
+# Stacked bar chart df
+`%not in%` <- Negate(`%in%`)
+stacked_bar_df <- melted_rel_ab_df %>%
+  mutate_if(is.factor, as.character) %>%
+  mutate(taxa = ifelse(taxa %not in% top_taxa, "Other", taxa)) %>%
+  group_by(sid, taxa, x, pes_delta) %>%
+  summarise(rel_ab = sum(rel_ab)) %>%
+  arrange(taxa) %>% ungroup()
+taxa_order <- c("Other", top_taxa)
+stacked_bar_df$taxa <- factor(stacked_bar_df$taxa, levels = taxa_order, labels = taxa_order)
+
+# Set palette
+pal <- c(
+  "gray80", "deeppink4", "deeppink", "#A86825", "#F5C28E", "#F5E49A", "#FFAA01", 
+  "#A82B20", "#FC948B", "#2874AD", "#7CC1F5", "#4042A8", "#BBBCFC", "#A63BA8", 
+  "#FBB3FC", "seagreen3", "#B7F593", "goldenrod", "slategray1", "gray25")
+
+# Bar chart
+stacked_bar_plot <- stacked_bar_df %>%
+  ggplot(aes(x = x, y = rel_ab)) +
+  geom_bar(aes(fill = taxa), position="stack", stat="identity") +
+  geom_point(aes(x, y = 105, color = pes_delta), size=5, shape=15) +
+  scale_fill_manual(values = pal) +
+  scale_colour_gradient2() +
+  labs(x="", y="") +
+  guides(
+    fill = guide_legend(title = element_blank(), ncol = 4),
+    color = guide_legend(title = "FEV-1 %Pred Change")) +
+  theme_bw() +
+  theme(
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.position="bottom",
+    legend.text=element_text(size=7),
+    legend.margin=ggplot2::margin(t=-20),
+    legend.box="vertical",
+    legend.spacing.y = unit(1, "cm"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.border = element_blank())
+
+stacked_bar_plot
+```
+
+```{r}
+# Create dendrogram to order samples by similar composition
+taxa_names <- sub('.*\\/', '', colnames(microb_rel_data.genus))
+rel_ab_df <- microb_rel_data.genus %>%
+  set_colnames(taxa_names)
+
+# Dendrogram
+dendrogram <- rel_ab_df %>%
+  vegdist(method = "bray") %>%
+  hclust(method = "ward.D2") %>%
+  as.dendrogram() %>%
+  dendro_data(type = "rectangle")
+
+# Get x order mapped to SID
+dend_labels <- dendrogram$labels %>%
+  as.data.frame() %>%
+  mutate(rownames = label) %>%
+  column_to_rownames("rownames") %>%
+  base::merge(metadata, by = 'row.names') %>%
+  column_to_rownames("Row.names") %>%
+  mutate(sid = paste0("SID", sid)) %>% 
+  dplyr::select(x, sid)
+
+## Visualize Compositional Data
+fev1_vals <- metadata %>% dplyr::select(sid, pes_delta) %>% mutate(sid = paste0("SID", sid)) %>% remove_rownames()
+melted_rel_ab_df <- rel_ab_df %>%
+  merge(metadata %>% set_rownames(rownames(microb_clr_data)) %>% dplyr::select(sid), by = "row.names") %>%
+  column_to_rownames("Row.names") %>%
+  dplyr::select(sid, everything()) %>%
+  mutate(sid = paste0("SID", sid)) %>% 
+  melt(idvars=c(sid)) %>% 
+  dplyr::rename(taxa = variable, rel_ab = value) %>%
+  mutate(rel_ab = rel_ab * 100) %>% # Convert to out of 100
+  base::merge(fev1_vals) %>%
+  base::merge(dend_labels) %>%
+  arrange(x, taxa)
+
+# Determine top 15 most prevalent taxa
+top_taxa <- melted_rel_ab_df %>%
+  group_by(taxa) %>%
+  summarise(sum = sum(rel_ab)) %>%
+  arrange(desc(sum)) %>% ungroup() %>%
+  head(19) %>% 
+  mutate(taxa = as.character(taxa)) %>%
+  pull(taxa)
+
+# Stacked bar chart df
+`%not in%` <- Negate(`%in%`)
+stacked_bar_df <- melted_rel_ab_df %>%
+  mutate_if(is.factor, as.character) %>%
+  mutate(taxa = ifelse(taxa %not in% top_taxa, "Other", taxa)) %>%
+  group_by(sid, taxa, x, pes_delta) %>%
+  summarise(rel_ab = sum(rel_ab)) %>%
+  arrange(taxa) %>% ungroup()
+taxa_order <- c("Other", top_taxa)
+stacked_bar_df$taxa <- factor(stacked_bar_df$taxa, levels = taxa_order, labels = taxa_order)
+
+# Set palette
+pal <- c(
+  "gray80", "deeppink4", "deeppink", "#A86825", "#F5C28E", "#F5E49A", "#FFAA01", 
+  "#A82B20", "#FC948B", "#2874AD", "#7CC1F5", "#4042A8", "#BBBCFC", "#A63BA8", 
+  "#FBB3FC", "seagreen3", "#B7F593", "goldenrod", "slategray1", "gray25")
+
+# Bar chart
+stacked_bar_plot <- stacked_bar_df %>%
+  ggplot(aes(x = x, y = rel_ab)) +
+  geom_bar(aes(fill = taxa), position="stack", stat="identity") +
+  geom_point(aes(x, y = 105, color = pes_delta), size=5, shape=15) +
+  scale_fill_manual(values = pal) +
+  scale_colour_gradient2() +
+  labs(x="", y="") +
+  guides(
+    fill = guide_legend(title = element_blank(), ncol = 4),
+    color = guide_legend(title = "FEV-1 %Pred Change")) +
+  theme_bw() +
+  theme(
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.position="bottom",
+    legend.text=element_text(size=7),
+    legend.margin=ggplot2::margin(t=-20),
+    legend.box="vertical",
+    legend.spacing.y = unit(1, "cm"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.border = element_blank())
+
+stacked_bar_plot
+```
+
+# Hypothesis Testing
+## Tests of Association Between Omics Sets
+This test should tell us if potential associations might exist between the microbiome and proteomics data sets.  
+**Note**: Using CLR-transformed microbiome as input to this test, need to check if this is valid
+```{r, message=F}
+# Source: https://web.stanford.edu/class/bios221/Pune/Labs/Lab_DataIntegration/Lab_DataIntegration.html
+x <- microb_clr_data.genus %>% remove_rownames() %>% as.matrix()
+z <- proteomics_data %>% dplyr::select(-soma_sample_id) %>% log2() %>%
+  remove_rownames() %>% as.matrix()
+
+# Tests for association between the two matrices
+set.seed(0)
+pca1 = dudi.pca(x, scal = TRUE, scann = FALSE)
+pca2 = dudi.pca(z, scal = TRUE, scann = FALSE)
+rv1 = RV.rtest(pca1$tab, pca2$tab, 999)
+rv1
+```
+
+## Sparse CCA
+Sparse CCA is a method for identifying sparse linear combinations of the two sets of features that are highly correlated with each other. So in this case we are looking for highly correlated taxa/protein signals. With the selected hyperparameters (L1 penalties), which are completely arbitrary here and can (should) be determined in a more systematic way, we get 18 taxa and 67 proteome features that are in some fashion highly correlated (some taxa are likely highly correlated with multiple proteins, and perhaps vice versa).
+
+**Note:** I selected arbitrary L1 penalties for each data type (we can more finely tune these).  
+
+```{r}
+# Involving the outcome
+y <- sample_data(physeq.filtered) %>% as.data.frame() %>% pull(pes_delta) %>% as.matrix()
+
+perm.out = PMA::CCA.permute(
+  x, z, typex = "standard", typez = "standard",
+  penaltyxs=expand.grid(seq(.05, .45, by=0.1), seq(.05, .45, by=0.1))$Var1, 
+  penaltyzs=expand.grid(seq(.05, .45, by=0.1), seq(.05, .45, by=0.1))$Var2,
+  nperms = 10)
+
+perm.out
+```
+
+```{r}
+cca = PMA::CCA(
+  x, z, typex = "standard", typez = "standard",
+  penaltyx = perm.out$bestpenaltyx, perm.out$bestpenaltyz
+)
+
+print(cca)
+
+score.x <- scale(x) %*% cca$u
+score.z <- scale(z) %*% cca$v
+diag(cor(score.x, score.z))
+
+microbe_select <- x[, t(cca$u) != 0]
+protein_select <- z[, t(cca$v) != 0]
+cca_combined <- cbind(microbe_select, protein_select)
+```
+
+```{r}
+short_microbe_names <- sub('.*\\/', '', colnames(microbe_select))
+microb_rel_data.genus %>% select(colnames(microbe_select)) %>% 
+  set_colnames(short_microbe_names) %>%
+  pivot_longer(cols=short_microbe_names) %>%
+  select(rel_ab = value, Taxa = name) %>%
+  ggplot() +
+  geom_boxplot(aes(x = rel_ab, fill = Taxa)) +
+  theme_bw()
+```
+
+## PCA of Sparse CCA Results
+```{r}
+pca <- dudi.pca(cca_combined, scannf = FALSE, nf = 3)
+
+sampleInfo = data.frame(pca$li, metadata %>% dplyr::select(pes_delta))
+featureInfo = data.frame(pca$c1, feature = sub('.*\\/', '', colnames(cca_combined)))
+featureType = grepl("\\.", colnames(cca_combined))
+featureType = ifelse(featureType, "Protein", "OTU")
+
+pca_plot <- ggplot() +  
+  geom_point(
+    data = sampleInfo, aes(x = Axis1, y = Axis2, color = pes_delta), size = 4, alpha = 0.95) +
+  scale_fill_manual(values = c("darkgoldenrod1", "azure3")) +
+  scale_colour_gradient2(
+    low = muted("red"),
+    mid = "white",
+    high = muted("blue"),
+    midpoint = -5) +
+  guides(fill = guide_legend(override.aes = list(shape = 32, size = 0))) +
+  coord_fixed()+
+  labs(x = sprintf("Axis 1 [%s%% Variance]", 100 * round(pca$eig[1] / sum(pca$eig), 2)),
+       y = sprintf("Axis 2 [%s%% Variance]", 100 * round(pca$eig[2] / sum(pca$eig), 2)),
+       fill = "Feature Type", col = "FEV-1 Recovery") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+pca_plot_labeled <- pca_plot +
+  geom_label_repel(
+    data = featureInfo, 
+    aes(x = 10 * CS1, y = 10 * CS2, label = feature, fill = featureType), 
+    size = 2.5, segment.size = 0.3, label.padding = unit(0.1, "lines"), label.size = 0) +
+  geom_point(
+    data = featureInfo, 
+    aes(x = 10 * CS1, y = 10 * CS2, fill = featureType), size = 2, shape = 23, col = "#383838")
+
+pca_plot_display <- ggarrange(pca_plot, pca_plot_labeled, ncol = 1, nrow = 2)
+pca_plot_display
+```
+
+
+## PERMANOVA
+This test shows a significant association between the microbiome and the FEV-1 % predicted difference. I added in baseline FEV-1 % predicted as a covariate to control for FEV-1 at admission. Of course, the p-value might be inflated since we are not controlling for potential confounders. Nonetheless, this result is interesting and warrants further exploration.
+
+```{r}
+# Filter data
+pseq <- physeq %>% subset_samples(!is.na(pes_delta))
+physeq.filtered <- pseq %>% microbiome::transform("compositional") %>% microbiome::core(detection = 1e-5, prevalence = 0.5)
+microb_filt_data <- physeq.filtered %>% abundances() %>% t() %>% as.data.frame()
+
+# Perform test
+permanova <- adonis2(microb_filt_data ~ pes_delta, data = meta(physeq.filtered), by="margin", permutations = 999, method = "bray")
+permanova %>% as.data.frame() %>% 
+  mutate_if(is.numeric, ~round(., 3)) %>% 
+  dplyr::rename("p.val" = "Pr(>F)") %>%
+  mutate(p.val = ifelse(p.val <= 0.05, paste("**", p.val, "****", sep=""), p.val)) %>% 
+  mutate_if(is.numeric, ~round(., 2)) %>%
+  knitr::kable(align = 'ccccc')
+```
+
+
+

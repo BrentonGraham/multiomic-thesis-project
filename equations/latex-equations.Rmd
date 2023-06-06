@@ -1,0 +1,24 @@
+---
+title: "Paper Equations"
+author: "Brenton Graham"
+date: "2023-06-02"
+output: html_document
+---
+
+# CCA
+$$
+(w_1, w_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}\:\mathrm{Cor}(X_1\tilde{w}_1,X_2\tilde{w}_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}\:\tilde{w}_1^TX_1^TX_2\tilde{w}_2
+
+\\ \mathrm{subject\:to}\: \tilde{w}_1^TX_1^TX_1\tilde{w}_1 = \tilde{w}_2^TX_2^TX_2\tilde{w}_2 = 1
+
+\\ (1)
+$$
+
+# SmCCA
+$$
+(w_1, w_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}\:(a\tilde{w}_1^TX_1^TX_2\tilde{w}_2 + b\tilde{w}_1^TX_1^TY + c\tilde{w}_2^TX_2^TY)
+
+\\ \mathrm{subject\:to}\: ||\tilde{w}_s||^2 = 1,\: P_s(\tilde{w}_s) \leq c_s,\: s = 1, 2
+
+\\ (2)
+$$

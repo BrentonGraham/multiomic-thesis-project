@@ -1,0 +1,242 @@
+---
+title: "SmCCNet: Data Preprocessing"
+author: "Brenton Graham"
+date: "2023-05-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(phyloseq)
+require(microbiome)
+require(ade4)
+require(PMA)
+require(vegan)
+require(ggrepel)
+require(scales)
+require(ggpubr)
+require(SmCCNet)
+require(Matrix)
+require(compositions)
+```
+
+# Data Preparation
+```{r, message = F}
+# Full set mutliomics set
+data <- "/Users/bgraham/Research/883/Data/Merged Data/883MergedData.20221026.csv" %>% read_delim(delim = ",")
+
+# Not in function
+`%not in%` <- Negate(`%in%`)
+
+# Select appropriate data for study
+inclusion_data <- data %>% 
+  filter(sid > 25) %>%                    # SIDs > 25
+  filter(sample_type_16S == "Sputum") %>% # Select samples with sputum sequencing data
+  filter(!is.na(proteomics_batch)) %>%    # Select samples with both microbiome/proteome data
+  filter(time != 3) %>%                   # Remove follow-up data
+  # Label T1 and T2 vars
+  mutate(time = factor(time, levels = c(1, 2), labels = c("T1", "T2"))) %>%
+  # Remove proteomics dupes
+  unite("id_and_prot_batch", c(soma_sample_id, proteomics_batch), sep = "_", remove = F) %>%
+  filter(id_and_prot_batch %not in% c("S821-364_20170126", "S821-323_20170126", "S821-276_20170126"))
+
+# Get all FEV-1 data for T1 and T2 and calculate pes_delta (fev1_pred_T2 - fev1_pred_T1)
+pes_df <- data %>% 
+  filter(sid > 25) %>% 
+  filter(time != 3) %>% # Inclusion criteria
+  dplyr::select(sid, time, pes_total) %>%    # Select columns needed for calculation
+  unique() %>%                               # Drop repeat rows (FEV same for sputum/saliva samples)
+  mutate(time = factor(time, levels = c(1, 2), labels = c("pes_T1", "pes_T2"))) %>%
+  pivot_wider(names_from = time, values_from = pes_total) %>%
+  mutate(pes_delta = pes_T2 - pes_T1)
+
+# Merge outcome into data frame
+inclusion_data <- merge(inclusion_data, pes_df, all.x = T, all.y = F) %>%
+  relocate(c("pes_delta", "pes_T1", "pes_T2"), .after = pes_total)
+
+# Microbiome data
+microbiome_data <- inclusion_data %>% 
+  filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(soma_sample_id, contains("Bacteria/"), -contains("other"))
+
+# Proteomics data
+proteomics_data <- inclusion_data %>% 
+  filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(soma_sample_id, contains("seq"))
+
+# CLR transformation
+otu_table <- microbiome_data %>% dplyr::select(-soma_sample_id) %>% t() %>% otu_table(taxa_are_rows=T)
+metadata <- inclusion_data %>% filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% dplyr::select(-contains("Bacteria"), -contains("seq"))
+otu_names <- otu_table %>% as.data.frame() %>% rownames()
+tax_levels <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+otu_tax_split <- sapply(otu_names, FUN=function(x) strsplit(x, "/"))
+tax_table <- plyr::ldply(otu_tax_split, rbind)[-1] %>%
+  set_rownames(otu_names) %>%
+  set_colnames(tax_levels) %>%
+  as.matrix()
+physeq <- phyloseq(otu_table(otu_table), tax_table(tax_table), sample_data(metadata))
+physeq.filtered <- physeq %>% microbiome::transform("compositional") %>% microbiome::core(detection = 1e-3, prevalence = 10/100)
+microb_rel_data <- physeq.filtered %>% abundances() %>% t() %>% as.data.frame()
+microb_clr_data <- physeq.filtered %>% microbiome::transform("clr") %>% abundances() %>% t() %>% as.data.frame()
+
+# Ready modalities and outcome for output
+x1 <- proteomics_data %>% dplyr::select(-soma_sample_id) %>% log2() %>% remove_rownames() %>% as.matrix()
+x2 <- microb_clr_data %>% remove_rownames() %>% as.matrix()
+y <- sample_data(physeq.filtered) %>% as.data.frame() %>% pull(pes_delta) %>% as.matrix()
+
+# Shuffle rows
+set.seed(1) # For reproducibility
+shuffle <- sample(nrow(y))
+x1 <- x1[shuffle, ]
+x2 <- x2[shuffle, ]
+y <- y[shuffle, ]
+
+# Output processed data files
+x1 %>% write.table("./data/x1.proteomics_set.csv", sep = ",", row.names = F)
+x2 %>% write.table("./data/x2.microbiome_set.csv", sep = ",", row.names = F)
+y %>% write.table("./data/y.delta_pes.csv", sep = ",", row.names = F)
+
+data %>% 
+  filter(sid > 25) %>% 
+  filter(time != 3) %>% # Inclusion criteria
+  dplyr::select(sid, time, pes_total) %>%    # Select columns needed for calculation
+  unique()
+
+microbiome_data %>% soma_sample_id
+```
+
+# Table One
+```{r}
+# Create table to make table 1 from
+table1_data <- inclusion_data %>%
+  mutate_at(vars(psa_muc:burk), as.numeric) %>%
+  mutate(
+    pseudo_aer = psa_muc + psa_nonmuc,
+    staph_aur = staph + mrsa,
+    achromobacter = axylos + achromo) %>%
+  mutate(bmi = weight / ((height * 0.01)^2)) %>%
+  dplyr::select(
+    sid, soma_sample_id, time, sid_first, ex_num, gender, genotype, age, bmi, pe_pastyr, 
+    hosp_pastyr, admit_novirus, negative, pseudo_aer, staph_aur, 
+    achromobacter, hflu, smalto, burk, pe_pastyr, fev1_pred, pes_total) %>%
+  mutate(
+    pseudo_aer = ifelse(is.na(pseudo_aer), NA, ifelse(pseudo_aer == 0, 0, 1)),
+    pseudo_aer = as.numeric(ifelse(negative == 1, 0, pseudo_aer)),
+    staph_aur = ifelse(is.na(staph_aur), NA, ifelse(staph_aur == 0, 0, 1)),
+    staph_aur = as.numeric(ifelse(negative == 1, 0, staph_aur)),
+    achromobacter = ifelse(is.na(achromobacter), NA, ifelse(achromobacter == 0, 0, 1)),
+    achromobacter = as.numeric(ifelse(negative == 1, 0, achromobacter)),
+    hflu = as.numeric(ifelse(negative == 1, 0, ifelse(hflu == "NO RESULTS", NA, hflu))),
+    smalto = as.numeric(ifelse(negative == 1, 0, ifelse(smalto == "NO RESULTS", NA, smalto))),
+    burk = as.numeric(ifelse(negative == 1, 0, burk)),
+    admit_novirus = ifelse(admit_novirus == "NOT DONE", NA, admit_novirus),
+    negative = ifelse(negative == "NO RESULTS", NA, negative)) %>%
+  mutate(
+    admit_virus = factor(admit_novirus, levels = c(0, 1), labels = c(1, 0)),
+    gender = factor(gender, levels = c(1, 2), labels = c("Male", "Female")),
+    genotype = factor(genotype, levels = c(0:2), labels = c("0 F508del", "1 F508del", "2 F508del"))) %>%
+  arrange(sid_first, sid, time) %>%
+  filter(soma_sample_id %in% c(microbiome_data %>% pull(soma_sample_id))) %>%
+  merge(pes_df, all.x = T, all.y = F) %>%
+  dplyr::select(
+    time, gender, genotype, age, bmi, fev1_pred, pes_total, pes_delta, pseudo_aer, 
+    staph_aur, hflu, smalto, burk, admit_virus)
+
+# Create table one
+vars <- c(
+  "gender", "age", "bmi", "genotype", "fev1_pred", "pes_total", "pes_delta", "pseudo_aer", 
+  "staph_aur", "hflu", "smalto", "burk", "admit_virus")
+cat_vars <- c("gender", "genotype", "pseudo_aer", "staph_aur", "hflu", "smalto", "burk", "admit_virus")
+row_order <- c(
+  "n", "Female (%)", "Age (Years)", "Body Mass Index", "CF Mutations", 
+  "0 F508del (%)", "1 F508del (%)", "2 F508del (%)", "FEV-1% Predicted", 
+  "PEx Score (PExS)", "ΔPExS", "CF Bacteria Culture (% Positive)",
+  "Pseudomonas aeruginosa", "Staphylococcus aureus", "Haemophilus", 
+  "Stenotrophomonas", "Burkholderia", "Viral Infection (%)")
+table1 <- CreateTableOne(vars = vars, factorVars = cat_vars, data = table1_data) 
+table1 <- print(table1, print = F, nonnormal = T, minMax = T) %>% 
+  as.data.frame() %>%
+  set_rownames(c(
+    "n", "Female (%)", "Age (Years)", "Body Mass Index", "CF Mutations", 
+    "0 F508del (%)", "1 F508del (%)", "2 F508del (%)", "FEV-1% Predicted", 
+    "PEx Score (PExS)", "ΔPExS", "Pseudomonas aeruginosa", "Staphylococcus aureus", 
+    "Haemophilus", "Stenotrophomonas", "Burkholderia", "Viral Infection (%)")) %>%
+  rbind("CF Bacteria Culture (% Positive)" = c("")) %>%
+  rownames_to_column("row.names") %>%
+  arrange(match(row.names, row_order)) %>%
+  column_to_rownames("row.names") %>%
+  dplyr::select("Study Cohort" = Overall) %>%
+  kbl(booktabs = TRUE, align = "c") %>%
+  #kable_styling(latex_options = c("scale_down", "hold_position")) %>%
+  kable_classic_2(full_width = F, html_font = "Arial") %>%
+  add_indent(c(6:8, 13:17))
+
+# Save table as image
+table1 %>% save_kable(file = "figures-and-tables/table1.png", zoom = 5)
+```
+
+# Phenotype Distribution
+```{r}
+# Plotting Phenotype Distribution
+phenotype_distplot <- data.frame("pes_delta" = y) %>%
+  ggplot(aes(x = pes_delta)) +
+  geom_histogram(binwidth = 3, color = "white", fill = "gray20") +
+  ggtitle("Phenotype Distribution") +
+  scale_y_continuous(name = "Number of Subjects (n)", limits = c(0, 13), breaks = c(0, 5, 10)) +
+  scale_x_continuous(
+    name = "ΔPExS", 
+    breaks = seq(-15, 0, by = 3)) +
+  theme_bw() + 
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid = element_blank())
+ggsave("figures-and-tables/phenotype-distribution.png", width = 7, height = 3)
+```
+
+# Correlation Analysis
+```{r}
+# Proteomics and phenotype correlations
+x1y_cor <- cor(x1, y) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("rho")) %>% 
+  mutate(corr_comparison = "proteomics-phenotype") %>%
+  dplyr::select(corr_comparison, rho)
+
+# Microbiome and phenotype correlations
+x2y_cor <- cor(x2, y) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("rho")) %>% 
+  mutate(corr_comparison = "microbiome-phenotype") %>%
+  dplyr::select(corr_comparison, rho)
+
+# Microbiome and proteomics correlations
+x1x2_cor <- cor(x1, x2) %>% 
+  as.data.frame() %>% 
+  melt(value.name = "rho") %>% 
+  mutate(corr_comparison = "between-omics") %>% 
+  dplyr::select(corr_comparison, rho)
+
+# Full data frame for plotting
+cor_mat <- rbind(x1y_cor, x2y_cor, x1x2_cor) %>%
+  mutate(corr_comparison = factor(
+    corr_comparison, 
+    levels = c("between-omics", "proteomics-phenotype", "microbiome-phenotype"),
+    labels = c(bquote("Protein-Microbiota"), "Protein-ΔPExS", "Microbiota-ΔPExS")))
+
+# Plot
+between_set_corr_plot <- ggplot(cor_mat, aes(x = corr_comparison, y = rho)) +
+  geom_violin(fill = "gray20") +
+  geom_boxplot(width = 0.1, alpha = 0.3, color = "gray80", fill = "white") +
+  labs(x = "", y = "Pearson Correlation") +
+  theme_bw()
+ggsave("figures-and-tables/between-dataset-corr-plot.png", width = 7, height = 3)
+```
+
+
+

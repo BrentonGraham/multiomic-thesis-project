@@ -1,0 +1,467 @@
+---
+title: "SmCCNet: Jackknifing"
+author: "Brenton Graham"
+date: "2023-05-21"
+output: html_document
+---
+
+```{r setup, include = F, message = F}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(ggpubr)
+require(SmCCNet)
+require(Matrix)
+source("r-functions/network-summarization-function.R")
+```
+
+# Import Data
+```{r, message = FALSE}
+# Import omics sets and outcome
+X1 <- read_delim("./data/x1.microbiome_set.csv", delim = ",")
+X2 <- read_delim("./data/x2.proteomics_set.csv", delim = ",")
+Y <- read_delim("./data/y.delta_pes.csv", delim = ",")
+
+# Import CV selected penalization parameters (optimal lambda pair)
+cv_file <- "./results/SmCCNet-5FoldCV-Unweighted-PES/TotalPredictionError.csv"
+cv_results <- read.table(cv_file, sep = ",", header = T)
+pen <- which(cv_results$cc_pred_error == min(cv_results$cc_pred_error))
+l1 <- cv_results$l1[pen]; l2 <- cv_results$l2[pen]
+
+# Create jackknife directory
+jackknife_dir <- "./results/SmCCNet-Jackknife-PES/"
+dir.create(jackknife_dir, showWarnings = F)
+```
+
+# Perform Jackknifed SmCCNet
+```{r}
+# Make subdir
+jackknife_smccnet_dir <- paste0(jackknife_dir, "smccnet-output")
+dir.create(jackknife_smccnet_dir, showWarnings = F)
+
+# Determine iterations already processed
+get_iter_number <- function(str) { 
+  split1 <- str_split(str, "jackknife-R-objects-iteration")[[1]][2]
+  split2 <- as.numeric(str_split(split1, ".Rdata")[[1]][1])
+  return (split2)
+}
+
+# Files present in output dir
+jk_files <- list.files(jackknife_smccnet_dir)
+first_iter <- max(unlist(lapply(jk_files, get_iter_number))) + 1
+
+# Iterate through data set removing one sample at a time and performing SmCCNet
+for (i in seq(first_iter, nrow(Y))){
+  
+  # Message
+  cat(paste0("Testing removal of sample ", i, "/", nrow(Y), "..."))
+  
+  # Remove sample
+  X1_jk <- X1[c(-i), ]
+  X2_jk <- X2[c(-i), ]
+  Y_jk <- Y[c(-i), ]
+  
+  # Get canonical correlation weight matrix
+  weights <- getRobustPseudoWeights(
+    X1_jk, X2_jk, Y_jk, l1, l2, NoTrait = FALSE, FilterByTrait = FALSE, SubsamplingNum = 500)
+  
+  # Set label names; sub() shortens taxa names
+  abar_label <-  sub('.*\\/', '', colnames(cbind(X1_jk, X2_jk)))
+  
+  # Compute adjacency/similarity matrix based on outer products of abs(weights)
+  abar <- SmCCNet::getAbar(weights, P1 = ncol(X1_jk), abar_label)
+  
+  # Get omics modules
+  modules <- getMultiOmicsModules(abar, ncol(X1_jk))
+  
+  # Get correlation matrix
+  big_cor <- cor(cbind(X1_jk, X2_jk))
+  
+  # Save objects for jackknife iteration
+  save(file = paste0(jackknife_smccnet_dir, "/jackknife-R-objects-iteration", i, ".Rdata"), 
+    X1_jk = X1_jk, X2_jk = X2_jk, y = Y_jk, weights = weights, 
+    abar_label = abar_label, abar = abar, modules = modules, big_cor = big_cor)
+}
+```
+
+# Subnetwork Summarization
+```{r}
+# Prune subnetworks ------------------------------------------------------------
+# Make subdir
+jackknife_subnet_dir <- paste0(jackknife_dir, "subnetwork-summarization-nofilter")
+dir.create(jackknife_subnet_dir, showWarnings = F)
+
+# Iterate through resamples
+for (i in 1:nrow(Y)) {
+  
+  # Message for log
+  cat(paste0("Resample ", i, "/", nrow(Y), "..."))
+
+  # Load CV objects
+  load(paste0(jackknife_smccnet_dir, "/jackknife-R-objects-iteration", i, ".Rdata"))
+  
+  # Create directory to store subnetwork files
+  subnetwork_dir <- paste0(jackknife_subnet_dir, "/jackknife-iteration", i, "-subnetworks/")
+  dir.create(paste0(subnetwork_dir))
+  
+  # Iterate through subnetworks
+  for (m in 1:length(modules)) {
+    
+    cat(paste0("\nWorking on module ", m, "...\n"))
+    
+    # Skip modules with less than 3 nodes
+    if (length(modules[[m]]) < 3) {
+      cat("Module has too few nodes... Skipping module.\n")
+    }
+    
+    else {
+      # Extract subnetwork specific inputs (adjacency matrix, correlation matrix, data)
+      subnewtork_ind <- modules[[m]]
+      subnetwork_abar <- as.matrix(abar[subnewtork_ind, subnewtork_ind])
+      subnetwork_corr <- as.matrix(big_cor)[subnewtork_ind, subnewtork_ind]
+      subnetwork_data <- as.matrix(cbind(X1_jk, X2_jk) %>% set_colnames(abar_label))[, subnewtork_ind]
+      
+      # Labeling omics types
+      P1 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(-contains("seq")))
+      P2 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(contains("seq")))
+      types <- c(rep('taxa', P1), rep('protein', P2))
+      
+      # Prune subnetwork
+      Network_Summarization_PPR_single_nofilter(
+        Abar = subnetwork_abar, CorrMatrix = subnetwork_corr, type = types, 
+        Pheno = Y_jk %>% pull(), data = subnetwork_data, ModuleIdx = m, 
+        min_mod_size = 3, max_mod_size = 500, method = 'NetSHy', 
+        saving_dir = subnetwork_dir)
+    }
+  }
+  # Print new empty line to separate resamples
+  cat("\n")
+}
+```
+
+# Assessing Subnetworks of Taxa
+```{r}
+# Summarize subnetwork correlations with phenotype (taxa only) -----------------
+# Function to get list of module numbers from subnetwork dir
+get_module_number <- function(str) { 
+  split1 <- str_split(str, "subnetwork_")[[1]][2]
+  split2 <- as.numeric(str_split(split1, ".Rdata")[[1]][1])
+  return (split2)
+}
+
+# Object to store all resampling results
+jk_subnetwork_taxa_summary <- data.frame()
+
+# Iterate through resamples
+for (i in 1:nrow(Y)) {
+  
+  # Message for log
+  cat(paste0("Resample ", i, "/", nrow(Y), "...\n"))
+
+  # Load CV objects
+  cat(paste0("Loading ", jackknife_smccnet_dir, "/jackknife-R-objects-iteration", i, ".Rdata...\n\n"))
+  load(paste0(jackknife_smccnet_dir, "/jackknife-R-objects-iteration", i, ".Rdata"))
+  subnetwork_dir <- paste0(jackknife_subnet_dir, "/jackknife-iteration", i, "-subnetworks/")
+  subnetwork_files <- list.files(subnetwork_dir)
+  module_nums <- sort(unlist(lapply(subnetwork_files, get_module_number)))
+  
+  # Empty data frame to concatenate results
+  subnetwork_taxa_summary <- data.frame()
+  
+  # Iterate through each subnetwork and add correlation info to subnetwork_taxa_summary
+  for (module_num in module_nums) {
+    
+    # Load subnetwork-specific objects
+    load(paste0(subnetwork_dir, "subnetwork_", module_num, ".Rdata"))
+    
+    # Correlation of each taxon in module with the outcome
+    correlation_data <- omics_correlation_data %>%
+      filter(substr(name, 1, 3) != 'seq') %>% # Focus on taxa (remove proteins)
+      dplyr::select(correlation, p) %>%
+      round(3)
+    
+    # Skip if correlation_data is empty - will be empty if there are no taxa
+    if (nrow(correlation_data) == 0) {
+      cat(paste0("Module ", module_num, " has no taxa. Skipping...\n"))
+    }
+    
+    # Otherwise continue
+    else {
+      # Correlation of PC1 to phenotype
+      correlation_data$resampling_iter <- i
+      correlation_data$subnetwork <- module_num
+      correlation_data$subnet_corr_with_y <- as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3))
+      correlation_data$subnet_corr_with_y_p <- round(cor.test(pca_score_df[, 1], pca_score_df[, 4])$p.value, 3)
+      
+      # Append subnetwork-specific results
+      subnetwork_taxa_summary <- rbind(subnetwork_taxa_summary, correlation_data)
+    }
+  }
+  
+  # Filter out subnetworks with no correlation to phenotype (enforce rho > 0.2)
+  taxa_phenotype_correlation_df <- subnetwork_taxa_summary %>%
+    rownames_to_column(var = "taxa")
+  
+  # Append all resampling results to a similar df
+  jk_subnetwork_taxa_summary <- rbind(jk_subnetwork_taxa_summary, taxa_phenotype_correlation_df)
+}
+```
+
+# Co-Occurrence of Taxa in Subnetworks
+```{r}
+# Make subdir
+jackknife_taxa_subnet_dir <- paste0(jackknife_dir, "taxa-subnetwork-summaries")
+dir.create(jackknife_taxa_subnet_dir, showWarnings = F)
+
+# Save CSV
+jk_subnetwork_taxa_summary %>% 
+  write.table(
+    paste0(jackknife_taxa_subnet_dir, "/_jackknife-taxa-subnet-df.csv"), 
+    sep = ",", row.names = F)
+
+# Get list of taxa
+taxa <- jk_subnetwork_taxa_summary %>% arrange(taxa) %>% pull(taxa) %>% unique()
+
+# Iterate through taxa
+for (bug in taxa) {
+  
+  # Bug-specific df
+  taxa_iters <- jk_subnetwork_taxa_summary %>% 
+    filter(taxa == bug) %>% 
+    dplyr::select(resampling_iter, subnetwork)
+  
+  # Vectors of 1) every resampling taxa appeared in and 2) subnetwork taxa appeared in per resample
+  resampling_nums <- taxa_iters$resampling_iter
+  subnets <- taxa_iters$subnetwork
+  
+  # Empty data frame 
+  taxa_co.occurrence_df <- data.frame()
+  
+  # Iterate through resamples and get taxa/subnetwork-specific cooccurence data 
+  for (i in seq(1, nrow(taxa_iters))) {
+    
+    # Get resample/subnetwork info for iteration
+    resampling_num <- resampling_nums[i]
+    subnet <- subnets[i]
+    
+    # Filter full df for resample/subnetwork number
+    iter_module_specific_df <- jk_subnetwork_taxa_summary %>%
+      filter(resampling_iter == resampling_num) %>%
+      filter(subnetwork == subnet)
+    
+    # Append df
+    taxa_co.occurrence_df <- rbind(taxa_co.occurrence_df, iter_module_specific_df)
+  }
+  
+  # Count the number of times each taxa appears
+  taxa_co.occurrence_df <- taxa_co.occurrence_df %>% 
+    dplyr::select(taxa) %>%
+    group_by(taxa) %>%
+    summarize(count = n(), perc_co.occur = round((n()/length(resampling_nums)) * 100)) %>%
+    arrange(desc(count))
+  
+  # Output bug-specific CSV
+  taxa_co.occurrence_df %>% 
+    write.table(
+      paste0(jackknife_taxa_subnet_dir, "/", tolower(bug), "-resampled-subnet-summary.csv"), 
+      sep = ",", row.names = F)
+}
+```
+
+# Assessing Subnetworks of Proteins
+```{r}
+# Summarize subnetwork correlations with phenotype (proteins only) -------------
+# Object to store all resampling results
+jk_subnetwork_prot_summary <- data.frame()
+
+# Iterate through resamples
+for (i in 1:nrow(Y)) {
+  
+  # Message for log
+  cat(paste0("Resample ", i, "/", nrow(Y), "...\n"))
+
+  # Load CV objects
+  load(paste0(jackknife_smccnet_dir, "/jackknife-R-objects-iteration", i, ".Rdata"))
+  subnetwork_dir <- paste0(jackknife_subnet_dir, "/jackknife-iteration", i, "-subnetworks/")
+  subnetwork_files <- list.files(subnetwork_dir)
+  module_nums <- sort(unlist(lapply(subnetwork_files, get_module_number)))
+  
+  # Empty data frame to concatenate results
+  subnetwork_prot_summary <- data.frame()
+  
+  # Iterate through each subnetwork and add correlation info to subnetwork_prot_summary
+  for (module_num in module_nums) {
+    
+    # Load subnetwork-specific objects
+    load(paste0(subnetwork_dir, "subnetwork_", module_num, ".Rdata"))
+    
+    # Correlation of each protein in module with the outcome
+    correlation_data <- omics_correlation_data %>%
+      filter(substr(name, 1, 3) == 'seq') %>% # Focus on proteins (remove taxa)
+      dplyr::select(correlation, p) %>%
+      round(3)
+    
+    # Skip if correlation_data is empty - will be empty if there are no protein
+    if (nrow(correlation_data) == 0) {
+      cat(paste0("Module ", module_num, " has no proteins. Skipping...\n"))
+    }
+    
+    # Otherwise continue
+    else {
+      # Correlation of PC1 to phenotype
+      correlation_data$resampling_iter <- i
+      correlation_data$subnetwork <- module_num
+      correlation_data$subnet_corr_with_y <- as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3))
+      correlation_data$subnet_corr_with_y_p <- round(cor.test(pca_score_df[, 1], pca_score_df[, 4])$p.value, 3)
+      
+      # Append subnetwork-specific results
+      subnetwork_prot_summary <- rbind(subnetwork_prot_summary, correlation_data)
+    }
+  }
+  
+  # Filter out subnetworks with no correlation to phenotype (enforce rho > 0.2)
+  prot_phenotype_correlation_df <- subnetwork_prot_summary %>%
+    rownames_to_column(var = "protein")
+  
+  # Append all resampling results to a similar df
+  jk_subnetwork_prot_summary <- rbind(jk_subnetwork_prot_summary, prot_phenotype_correlation_df)
+}
+```
+
+```{r, message = FALSE}
+# Make subdir
+jackknife_prot_subnet_dir <- paste0(jackknife_dir, "taxa-protein-subnetwork-summaries")
+dir.create(jackknife_prot_subnet_dir, showWarnings = F)
+
+# Save CSV
+jk_subnetwork_prot_summary %>% 
+  write.table(
+    paste0(jackknife_prot_subnet_dir, "/_jackknife-protein-subnet-df.csv"), 
+    sep = ",", row.names = F)
+
+# Get list of taxa
+taxa <- jk_subnetwork_taxa_summary %>% arrange(taxa) %>% pull(taxa) %>% unique()
+
+# Read in data frame with Somalogic aptamer information
+analyte_df <- paste0(getwd(), "/../../Data/Cleaned Data/ProteomicsData.analyte_info_table.csv") %>% 
+  read_delim(delim = ",")
+
+# Iterate through taxa
+for (bug in taxa) {
+  
+  # Bug-specific df
+  taxa_iters <- jk_subnetwork_taxa_summary %>% 
+    filter(taxa == bug) %>% 
+    dplyr::select(resampling_iter, subnetwork)
+  
+  # Vectors of 1) every resampling taxa appeared in and 2) subnetwork taxa appeared in per resample
+  resampling_nums <- taxa_iters$resampling_iter
+  subnets <- taxa_iters$subnetwork
+  
+  # Empty data frame 
+  taxa_prot_co.occurrence_df <- data.frame()
+  
+  # Iterate through resamples and get taxa/protrein subnetwork-specific cooccurence data 
+  for (i in seq(1, nrow(taxa_iters))) {
+    
+    # Get resample/subnetwork info for iteration
+    resampling_num <- resampling_nums[i]
+    subnet <- subnets[i]
+    
+    # Filter full df for resample/subnetwork number
+    iter_module_specific_df <- jk_subnetwork_prot_summary %>%
+      filter(resampling_iter == resampling_num) %>%
+      filter(subnetwork == subnet)
+    
+    # Append df
+    taxa_prot_co.occurrence_df <- rbind(taxa_prot_co.occurrence_df, iter_module_specific_df)
+  }
+  
+  # Count the number of times each taxa appears
+  taxa_prot_co.occurrence_df <- taxa_prot_co.occurrence_df %>% 
+    dplyr::select(protein) %>%
+    group_by(protein) %>%
+    summarize(count = n(), perc_co.occur = round((n()/length(resampling_nums))*100)) %>%
+    arrange(desc(count))
+  
+  # Get uniprot ids for aptamers
+  aptamer_names <- taxa_prot_co.occurrence_df %>% pull(protein)
+  analytes <- analyte_df %>% filter(AptName %in% aptamer_names)
+  uniprot <- analytes %>% pull(UniProt)
+  target <- analytes %>% pull(Target)
+  target_fullname <- analytes %>% pull(TargetFullName)
+  taxa_prot_co.occurrence_df <- taxa_prot_co.occurrence_df %>% 
+    mutate(
+      uniprot = uniprot,
+      target = target,
+      target_fullname = target_fullname) %>%
+    relocate(uniprot, .after = protein)
+  
+  # Output bug-specific CSV
+  taxa_prot_co.occurrence_df %>% 
+    write.table(
+      paste0(jackknife_prot_subnet_dir, "/", tolower(bug), "-resampled-prot-subnet-summary.csv"), 
+      sep = ",", row.names = F)
+}
+```
+
+# Comparing Co-Occurrence Protein Enrichment with non-JK Results
+## Atopobium
+```{r, message = FALSE}
+# Jackknife results
+bug <- "atopobium"
+taxa_proteins_jk <- paste0(jackknife_prot_subnet_dir, "/", bug, "-resampled-prot-subnet-summary.csv") %>%
+  read_delim(delim = ",") %>% 
+  filter(perc_co.occur > 10) %>%
+  pull(uniprot)
+
+# Full data set results
+subnetwork <- 6
+subnet_proteins <- paste0("./results/enrichment-results/subnetwork-", subnetwork, "-proteins.csv") %>%
+  read_delim(delim = ",") %>%
+  pull(UNIPROT)
+
+# Overlap
+cat(paste0(length(intersect(taxa_proteins_jk, subnet_proteins)), "/", length(subnet_proteins), " proteins present."))
+```
+
+## Pseudomonas Aeruginosa
+```{r, message = FALSE}
+# Jackknife results
+bug <- "pseudomonas aeruginosa"
+taxa_proteins_jk <- paste0(jackknife_prot_subnet_dir, "/", bug, "-resampled-prot-subnet-summary.csv") %>%
+  read_delim(delim = ",") %>% 
+  filter(perc_co.occur > 20) %>%
+  pull(uniprot)
+
+# Full data set results
+subnetwork <- 7
+subnet_proteins <- paste0("./results/enrichment-results/subnetwork-", subnetwork, "-proteins.csv") %>%
+  read_delim(delim = ",") %>%
+  pull(UNIPROT)
+
+# Overlap
+cat(paste0(length(intersect(taxa_proteins_jk, subnet_proteins)), "/", length(subnet_proteins), " proteins present."))
+```
+
+
+
+```{r}
+load(paste0(jackknife_smccnet_dir, "/jackknife-R-objects-iteration2.Rdata"))
+mod <- 13
+as.matrix(abar[modules[[mod]], modules[[mod]]])
+
+analyte_df %>% pull(UniProt) %>% unique() %>% length()
+```
+
+
+
+
+
+
+
+

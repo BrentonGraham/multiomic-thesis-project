@@ -1,0 +1,406 @@
+---
+title: "SmCCNet Network Analyses"
+author: "Brenton Graham"
+date: "2023-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(phyloseq)
+require(microbiome)
+require(ade4)
+require(PMA)
+require(vegan)
+require(ggrepel)
+require(scales)
+require(ggpubr)
+require(SmCCNet)
+require(Matrix)
+require(compositions)
+require(clusterProfiler)
+require(org.Hs.eg.db)
+require(pheatmap)
+require(compositions)
+require(ggforce)
+require(colorspace)
+require(RCy3)
+require(igraph)
+```
+
+# Data Preparation
+```{r, message = F}
+# Set data ---------------------------------------------------------------------
+X1 <- read_delim("./data/x1.proteomics_set.csv", delim = ",")
+X2 <- read_delim("./data/x2.microbiome_set.csv", delim = ",")
+Y <- read_delim("./data/y.delta_pes.csv", delim = ",")
+```
+
+# Subnetworks of Taxa
+```{r}
+# Summarize subnetwork correlations with PES (taxa only) -----------------------
+# Import CV objects
+cv_dir <- "./results/SmCCNet-5FoldCV-Weighted-1-2-2-PES/"
+load(paste0(cv_dir, "R-objects.Rdata"))
+
+# Empty data frame to concatenate results
+subnetwork_taxa_summary <- data.frame()
+
+# Iterate through each subnetwork (module) and add correlation info to subnetwork_taxa_summary
+for (mod in c(1, 3, 5)) {
+  
+  # Load subnetwork-specific objects
+  load(paste0(cv_dir, "pruned-subnetworks/subnetwork_", mod, ".Rdata"))
+  
+  # Correlation of each taxon in module with the outcome
+  correlation_data <- omics_correlation_data %>%
+    filter(substr(name, 1, 3) != 'seq') %>% # Focus on taxa (remove proteins)
+    dplyr::select(correlation, p) %>%
+    round(3)
+  
+  # Correlation of PC1 to phenotype
+  correlation_data$subnetwork <- mod
+  correlation_data$subnet_corr_with_y <- abs(as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3)))
+  correlation_data$subnet_corr_with_y_p <- round(cor.test(pca_score_df[, 1], pca_score_df[, 4])$p.value, 3)
+  
+  # Append subnetwork-specific results
+  subnetwork_taxa_summary <- rbind(subnetwork_taxa_summary, correlation_data)
+}
+
+# View table
+subnetwork_taxa_summary %>% knitr::kable()
+```
+
+# Subnetwork Node Correlations with Phenotype
+```{r}
+# Set empty objects to store results
+all_correlations_w_pheno_df <- data.frame()
+subnet_correlations_w_pheno <- rep(0, length(modules))
+module_names <- rep(0, length(modules))
+
+# Iterate through modules to get node correlation with phenotype data
+for (mod in 1:length(modules)) {
+  
+  # Load subnetwork-specific objects
+  load(paste0(cv_dir, "subnetworks/subnetwork_", mod, ".Rdata"))
+  module_names[mod] <- paste0("Network ", mod)
+  
+  # Correlation of each taxon in module with the outcome
+  module_correlation_data <- omics_correlation_data %>%
+    mutate(data_type = ifelse(substr(name, 1, 3) == 'seq', 'Protein', 'Taxon')) %>%
+    mutate(module = paste0("Network ", mod)) %>%
+    mutate(module_type = "SmCCNet Networks") %>%
+    rownames_to_column("node") %>%
+    dplyr::select(module, node, data_type, correlation, module_type)
+  
+  # Store subnet corr w pheno
+  subnet_correlations_w_pheno[mod] <- abs(as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3)))
+  
+  # Append results
+  all_correlations_w_pheno_df <- rbind(all_correlations_w_pheno_df, module_correlation_data)
+}
+
+# Add trimmed subnetwork data
+load(paste0(cv_dir, "pruned-subnetworks/subnetwork_1.Rdata"))
+module_correlation_data <- omics_correlation_data %>%
+  mutate(data_type = ifelse(substr(name, 1, 3) == 'seq', 'Protein', 'Taxon')) %>%
+  mutate(module = "Network 1") %>%
+  mutate(module_type = "Pruned Networks") %>%
+  rownames_to_column("node") %>%
+  dplyr::select(module, node, data_type, correlation, module_type)
+module_names <- c(module_names, "Network 1")
+subnet_correlations_w_pheno <- c(subnet_correlations_w_pheno, abs(as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3))))
+
+# Subnet corrs
+subnet_correlations_w_pheno <- data.frame(
+  "module" = module_names,
+  "correlation" = subnet_correlations_w_pheno,
+  "module_type" = c(rep("Networks", length(modules)), "Pruned")) %>%
+  mutate(module = factor(module, levels = module_names, labels = module_names)) %>%
+  mutate(module_type = factor(module_type, levels = c("Networks", "Pruned"), labels = c(expression(rho [Network-Pheno]), "")))
+
+# Append final trimmed subnetwork data
+all_correlations_w_pheno_df <- rbind(all_correlations_w_pheno_df, module_correlation_data) %>%
+  mutate(module = factor(module, levels = module_names, labels = module_names)) %>%
+  mutate(module_type = factor(module_type, levels = c("SmCCNet Networks", "Pruned Networks")))
+```
+
+# Network Summarization Plot - Figure 1
+```{r, warnings = F}
+# Subnetwork summarization plot 
+node_plot <- ggplot(all_correlations_w_pheno_df) +
+  geom_point(aes(x = correlation, y = module, shape = data_type, color = data_type), size = 2.5, alpha = 0.75) +
+  geom_vline(aes(xintercept = 0), linetype = 3, color = "grey25") +
+  ggforce::facet_col(~ module_type, scales = "free_y", space = "free") +
+  labs(x = "Node Correlation with Phenotype", color = "Node Type", shape = "Node Type") +
+  scale_color_manual(values = c("#0E00A2", "#C16E70")) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 11),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = c(0.905, 0.88),
+    legend.box.background = element_rect(colour = "black"),
+    axis.title.y = element_blank(), 
+    axis.text.y = element_text(
+      face = ifelse(levels(all_correlations_w_pheno_df$module) %in% c("Network 1", "Network 3"), "bold", "plain")))
+
+# Correlation heatmap
+correlation_heatmap_plot <- ggplot(subnet_correlations_w_pheno, aes(x = "", y = module, fill = correlation)) +
+  geom_tile() +
+  geom_label(
+    data = subnet_correlations_w_pheno %>% filter(correlation <= 0.3), 
+    aes(label = correlation), color = "black", label.size = NA) + 
+  geom_label(
+    data = subnet_correlations_w_pheno %>% filter(correlation > 0.3), 
+    aes(label = correlation), color = "gray90", label.size = NA) + 
+  ggforce::facet_col(~ module_type, scales = "free_y", space = "free", labeller = label_parsed) +
+  labs(x = "") +
+  scale_y_discrete(position = "right") +
+  scale_fill_continuous_sequential() +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 11),
+    legend.position = "none",
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_blank(), 
+    axis.text.y = element_text(
+      face = ifelse(levels(all_correlations_w_pheno_df$module) %in% c("Network 1", "Network 3"), "bold", "plain")))
+
+# Merge plots together
+plot1 <- ggarrange(node_plot, correlation_heatmap_plot, widths = c(3, 1))
+show(plot1)
+ggsave("figures-and-tables/network_summary_plot.png")
+```
+
+# Protein Enrichment within Subnetworks of Interest
+```{r}
+# Read in data frame with Somalogic aptamer information
+analyte_df <- paste0(getwd(), "/../../Data/Cleaned Data/ProteomicsData.analyte_info_table.csv") %>% 
+  read_delim(delim = ",")
+
+# "Universal" vector of uniprots - every protein in the assay
+# Convert to ENTREZID and use background list for enrichment analyses
+universe_uniprot <- analyte_df %>% pull(UniProt) %>% unique()
+universe_id_conv <- bitr(universe_uniprot, fromType = "UNIPROT", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Output background for external enrichment analyses
+universe_id_conv %>% write.table("./results/enrichment-results/universal_background.csv", sep = ",", row.names = F)
+
+# Iterate through each subnetwork (module) and perform enrichment analysis
+modules <- c(1, 3)
+for (i in modules) {
+  
+  # Load subnetwork-specific objects
+  load(paste0(cv_dir, "/pruned-subnetworks/subnetwork_", i, ".Rdata"))
+
+  # Get subnetwork-specific aptamer list
+  aptamer_names <- omics_correlation_data %>%
+    filter(substr(name, 1, 3) == 'seq') %>% # Remove taxa from list
+    dplyr::select(name) %>% pull()
+  
+  # Obtain vector of subnetwork-specific uniprots
+  module_analytes <- analyte_df %>% filter(AptName %in% aptamer_names)
+  module_uniprot <- module_analytes %>% pull(UniProt)
+  
+  # Convert uniprot vectors to ENTREZID for enrichGO
+  module_id_conv <- bitr(module_uniprot, fromType="UNIPROT", toType="ENTREZID", OrgDb = org.Hs.eg.db)
+  module_id_conv <- module_id_conv %>% 
+    dplyr::select(UniProt = UNIPROT, EntrezGeneID = ENTREZID) %>%
+    merge(module_analytes, all.y = F) %>% 
+    dplyr::select(UniProt, EntrezGeneID, Target, TargetFullName)
+  
+  # Output CSV of proteins
+  module_id_conv %>% write.table(
+    paste0("./results/enrichment-results/subnetwork-", i, "-proteins.csv"), 
+    sep = ",", row.names = F)
+  
+  # Enrichment of gene ontologies for subnetwork
+  enrichGO_analysis <- enrichGO(
+    gene = module_id_conv$EntrezGeneID %>% unique(),
+    universe = universe_id_conv$ENTREZID %>% unique(),
+    OrgDb = org.Hs.eg.db,
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 1,
+    qvalueCutoff = 1)
+  
+  # Output enrichGO results for subnetwork
+  summary(enrichGO_analysis) %>%
+    head(150) %>% 
+    as.data.frame() %>%
+    write.table(
+      paste0("./results/enrichment-results/clusterProfiler/subnetwork-", i, "-enrichGO-results.csv"), 
+      sep = ",", row.names = F)
+}
+
+goplot(enrichGO_analysis)
+```
+
+# Visualizing Subnetwork 3 (Traditional CF Pathogen Network)
+```{r}
+# Load subnetwork-specific data
+subnetwork <- 3
+load(paste0(cv_dir, "/pruned-subnetworks/subnetwork_", subnetwork, ".Rdata"))
+type <- omics_correlation_data %>% mutate(type = ifelse(substr(name, 1, 3) == 'seq', 'Protein', 'Taxa')) %>% pull(type)
+net_ppr <- igraph::graph_from_adjacency_matrix(M, weighted = TRUE, diag = FALSE, mode = "undirected")
+igraph::set_vertex_attr(net_ppr, "type", index = igraph::V(net_ppr), as.factor(type))
+ranking <- igraph::page_rank(net_ppr, directed = FALSE, damping = 0.9, options = list(niter = 10^5, eps = 1e-06))
+rank_names <- names(sort(ranking$vector, decreasing = TRUE))
+rank_value <- sort(ranking$vector, decreasing = TRUE)
+
+# Prune weak edges from network
+prune_index <- which(abs(subnet_corr) < 0.3)
+M_ind <- ifelse(subnet_corr > 0, 1, -1)
+M_pruned <- M * M_ind
+M_pruned[prune_index] <- 0
+diag(M_pruned) <- 0
+
+# Get pruned correlation information for cytoscape attributes
+`%not in%` <- Negate(`%in%`)
+pruned_omics_correlation_data <- omics_correlation_data %>% 
+  mutate(type = ifelse(substr(name, 1, 3) == 'seq', 'Protein', 'Taxa')) %>%
+  mutate(edge_relationship = ifelse(correlation > 0, "+", "-")) %>%
+  dplyr::select(AptName = name, everything()) %>%
+  merge((analyte_df %>% dplyr::select(AptName, Target, UniProt)), all.y = F, all.x = T) %>%
+  mutate(Target = ifelse(is.na(Target), AptName, Target)) %>%
+  dplyr::select(name = AptName, everything()) %>%
+  arrange(match(name, c(colnames(M_pruned)))) %>%
+  column_to_rownames("Target")
+
+# Update M column names
+rownames(M_pruned) <- rownames(pruned_omics_correlation_data)
+colnames(M_pruned) <- rownames(pruned_omics_correlation_data)
+M_pruned
+
+# Cytoscape
+graph <- igraph::graph_from_adjacency_matrix(
+  M_pruned, mode = 'undirected', weighted = TRUE, diag = TRUE, add.colnames = NULL, add.rownames = NA)
+
+# Check connection
+cytoscapePing ()
+cytoscapeVersionInfo ()
+
+# Add data to for cytoscape attributes
+igraph::V(graph)$correlation <- pruned_omics_correlation_data$correlation
+igraph::V(graph)$type <- pruned_omics_correlation_data$type
+igraph::E(graph)$edge_relationship <- factor(E(graph)$weight > 0, levels = c(T, F), c("+", "-"))
+  
+# Create network to access on cytoscape desktop
+createNetworkFromIgraph(graph, "pes-subnetwork-3-final")
+setNodeShapeDefault("ELLIPSE")
+layoutNetwork()
+```
+
+# Visualizing Subnetwork 1 (Robust Network)
+```{r}
+# Load subnetwork-specific data
+subnetwork <- 1
+load(paste0(cv_dir, "/pruned-subnetworks/subnetwork_", subnetwork, ".Rdata"))
+type <- omics_correlation_data %>% mutate(type = ifelse(substr(name, 1, 3) == 'seq', 'Protein', 'Taxa')) %>% pull(type)
+net_ppr <- igraph::graph_from_adjacency_matrix(M, weighted = TRUE, diag = FALSE, mode = "undirected")
+igraph::set_vertex_attr(net_ppr, "type", index = igraph::V(net_ppr), as.factor(type))
+ranking <- igraph::page_rank(net_ppr, directed = FALSE, damping = 0.9, options = list(niter = 10^5, eps = 1e-06))
+rank_names <- names(sort(ranking$vector, decreasing = TRUE))
+rank_value <- sort(ranking$vector, decreasing = TRUE)
+
+# Get maximum absolute weight connected to each node
+weight_connections_df <- data.frame(as_edgelist(graph), "weight" = as.numeric(E(graph)$weight))
+weight_connections_df <- rbind(
+  weight_connections_df %>% dplyr::select(X1, weight), 
+  weight_connections_df %>% dplyr::select(X1 = X2, weight)) %>%
+  group_by(X1) %>%
+  summarize(max_weight = max(abs(weight))) %>%
+  ungroup()
+
+# Histogram showing the distributions of max abs(weight) connected to each node
+#net1_max_wt_plot <- weight_connections_df %>%
+#  ggplot(aes(x = max_weight)) +
+#  geom_histogram(bins = 50) +
+#  geom_vline(aes(xintercept = 0.1), color = "lightblue", linetype = 2, linewidth = 1) +
+#  labs(x = "Maximum Weight")
+#  theme_bw() +
+#  theme(panel.grid.minor = element_blank())
+  
+# Select nodes to keep based on max(abs(weight)) > 0.2 threshold
+nodes_to_viz <- weight_connections_df %>% filter(max_weight > 0.2) %>% pull(X1)
+
+# Prune weak edges from network
+prune_index <- which(abs(subnet_corr) < 0.3)
+M_ind <- ifelse(subnet_corr > 0, 1, -1)
+M_pruned <- M * M_ind
+M_pruned[prune_index] <- 0
+diag(M_pruned) <- 0
+
+# Get pruned correlation information for cytoscape attributes
+pruned_omics_correlation_data <- omics_correlation_data %>% 
+  mutate(type = ifelse(substr(name, 1, 3) == 'seq', 'Protein', 'Taxa')) %>%
+  mutate(edge_relationship = ifelse(correlation > 0, "+", "-")) %>%
+  dplyr::select(AptName = name, everything()) %>%
+  merge((analyte_df %>% dplyr::select(AptName, Target, UniProt)), all.y = F, all.x = T) %>%
+  mutate(Target = ifelse(is.na(Target), AptName, Target)) %>%
+  dplyr::select(name = AptName, everything()) %>%
+  arrange(match(name, c(colnames(M_pruned)))) %>%
+  filter(name != "seq.14088.38") %>% # Filter out duplicate protein target
+  column_to_rownames("Target")
+
+# Update M column names and prune nodes with max(abs(weight)) < 0.1
+M_pruned <- M_pruned[!colnames(M_pruned) == "seq.14088.38", !colnames(M_pruned) == "seq.14088.38"]
+rownames(M_pruned) <- rownames(pruned_omics_correlation_data)
+colnames(M_pruned) <- rownames(pruned_omics_correlation_data)
+M_pruned <- M_pruned[colnames(M_pruned) %in% nodes_to_viz, colnames(M_pruned) %in% nodes_to_viz]
+pruned_omics_correlation_data <- pruned_omics_correlation_data %>% 
+  rownames_to_column("Target") %>%
+  filter(Target %in% nodes_to_viz) %>%
+  column_to_rownames("Target")
+
+# Check that features in each object are identical
+cat(paste0(
+  "Identical features between M and Correlation DF: ",
+  identical(rownames(M_pruned), rownames(pruned_omics_correlation_data))))
+
+# Cytoscape
+graph <- igraph::graph_from_adjacency_matrix(
+  M_pruned, mode = 'undirected', weighted = TRUE, diag = TRUE, add.colnames = NULL, add.rownames = NA)
+
+# Check connection
+cytoscapePing ()
+cytoscapeVersionInfo ()
+
+# Add data to for cytoscape attributes
+igraph::V(graph)$correlation <- pruned_omics_correlation_data$correlation
+igraph::V(graph)$type <- pruned_omics_correlation_data$type
+igraph::E(graph)$edge_relationship <- factor(E(graph)$weight > 0, levels = c(T, F), c("+", "-"))
+  
+# Create network to access on cytoscape desktop
+createNetworkFromIgraph(graph, "pes-subnetwork-1-prune-final")
+setNodeShapeDefault("ELLIPSE")
+layoutNetwork()
+```
+
+# Descriptive Statistics of Taxa 
+```{r}
+# Get rel abundance IQR
+# Taxa to fetch
+taxa <- row.names(subnetwork_taxa_summary)
+
+# Subset relative abundance DF
+iqr_df <- microb_rel_data %>% 
+  set_colnames(sub('.*\\/', '', colnames(microb_rel_data))) %>%
+  dplyr::select(taxa)
+
+# Get IQR, mean and median relative abundance for each taxa
+iqr <- lapply(iqr_df, quantile, probs=c(0.25, 0.75)) %>% as.data.frame()
+mean <- apply(iqr_df, 2, mean) %>% as.data.frame() %>% t() %>% as.data.frame() %>% set_rownames("mean") %>% set_colnames(colnames(iqr))
+median <- apply(iqr_df, 2, median) %>% as.data.frame() %>% t() %>% as.data.frame() %>% set_rownames("median") %>% set_colnames(colnames(iqr))
+iqr_df <- rbind(mean, median, iqr) * 100
+iqr_df <- iqr_df %>% t() %>% round(2)
+```
