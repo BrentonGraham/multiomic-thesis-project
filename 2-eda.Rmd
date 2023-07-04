@@ -1,0 +1,496 @@
+---
+title: 'SmCCNet: Sensitivity Analysis'
+author: "Brenton Graham"
+date: "2023-06-05"
+output: html_document
+---
+
+```{r setup, include = F, message = F}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(ggpubr)
+require(SmCCNet)
+require(Matrix)
+require(ggdendro)
+require(vegan)
+require(reshape2)
+source("r-functions/network-summarization-function.R")
+```
+
+# Import Data
+```{r, message = FALSE}
+# Set data ---------------------------------------------------------------------
+sample_data <- read_delim("./data/sample_data.csv", delim = ",")
+id_counts <- table(sample_data %>% pull(sid_first))
+repeated_ids <- names(id_counts[id_counts == 2])
+sample_data <- sample_data %>%
+  mutate(sample = ifelse(sid_first %in% repeated_ids, paste0("SID-", sid_first), "-")) %>%
+  dplyr::select(sid, sid_first, sample, soma_sample_id) %>%
+  mutate(rownames = soma_sample_id) %>%
+  column_to_rownames("rownames")
+inclusion_data <- read_delim("./data/inclusion_data.csv", delim = ",")
+X1 <- read_delim("./data/x1.proteomics_set.csv", delim = ",") %>%
+  mutate(soma_sample_id = sample_data$soma_sample_id) %>% # Set rownames
+  column_to_rownames("soma_sample_id")
+X2 <- read_delim("./data/x2.microbiome_set.csv", delim = ",")
+X2_relab <- read_delim("./data/x2_relab.microbiome_set.csv", delim = ",") %>%
+  mutate(soma_sample_id = sample_data$soma_sample_id) %>% # Set rownames
+  column_to_rownames("soma_sample_id")
+X2_relab_filtered <- read_delim("./data/x2_relab_filtered.microbiome_set.csv", delim = ",") %>%
+  mutate(soma_sample_id = sample_data$soma_sample_id) %>% # Set rownames
+  column_to_rownames("soma_sample_id")
+Y <- read_delim("./data/y.pes_perc_change.csv", delim = ",")
+```
+
+# Sample Dendrogram
+Checking how similar repeated measures are
+
+## Microbiome Data
+```{r}
+# Microbiome Data
+microbiome_dendro <- X2_relab_filtered %>% 
+  vegdist(method = "bray") %>% 
+  hclust(method = "ward.D2") %>% 
+  as.dendrogram() %>% 
+  dendro_data(type = "rectangle")
+
+microbiome_dendro$labels <- microbiome_dendro$labels %>%
+  mutate(rownames = label) %>%
+  column_to_rownames("rownames") %>%
+  base::merge(sample_data, by = 'row.names') %>%
+  dplyr::select(x, y, label = sample, soma_sample_id) %>%
+  arrange(x)
+
+microbiome_dendrogram <- ggdendrogram(microbiome_dendro)
+microbiome_dendrogram
+```
+
+## Proteomics Data
+```{r}
+# Proteomics Data
+protein_dendro <- X1 %>% 
+  vegdist(method = "manhattan") %>% 
+  hclust(method = "ward.D2") %>% 
+  as.dendrogram() %>% 
+  dendro_data(type = "rectangle")
+
+protein_dendro$labels <- protein_dendro$labels %>%
+  mutate(rownames = label) %>%
+  column_to_rownames("rownames") %>%
+  base::merge(sample_data, by = 'row.names') %>%
+  dplyr::select(x, y, label = sample, soma_sample_id) %>%
+  arrange(x)
+
+ggdendrogram(protein_dendro)
+```
+
+# Compositional Chart
+```{r}
+# Create dendrogram to order samples by similar composition
+dendrogram <- X2_relab %>%
+  vegdist(method = "bray") %>%
+  hclust(method = "ward.D2") %>%
+  as.dendrogram() %>%
+  dendro_data(type = "rectangle")
+
+# Reset label
+dendrogram_labels <- dendrogram$labels %>%
+  mutate(rownames = label) %>%
+  column_to_rownames("rownames") %>%
+  base::merge(sample_data, by = 'row.names') %>%
+  dplyr::select(x, y, label = sample, soma_sample_id) %>%
+  arrange(x)
+
+# Melt relative abundance data frame
+melted_rel_ab_df <- X2_relab_filtered %>%
+  set_colnames(sub('.*\\/', '', colnames(X2_relab_filtered))) %>%
+  merge(sample_data %>% dplyr::select(sample), by = "row.names") %>%
+  column_to_rownames("Row.names") %>%
+  dplyr::select(sample, everything()) %>%
+  rownames_to_column("soma_sample_id") %>%
+  melt(idvars=c(soma_sample_id, sample)) %>% 
+  dplyr::rename(taxa = variable, rel_ab = value) %>%
+  mutate(rel_ab = rel_ab * 100) %>% # Convert to out of 100
+  merge(dendrogram_labels) %>%
+  arrange(x, taxa)
+  
+# Top taxa
+top_taxa <- melted_rel_ab_df %>%
+  group_by(taxa) %>%
+  summarise(sum = sum(rel_ab)) %>%
+  arrange(desc(sum)) %>% ungroup() %>%
+  head(19) %>% 
+  mutate(taxa = as.character(taxa)) %>%
+  pull(taxa)
+
+# Stacked bar chart df
+`%not in%` <- Negate(`%in%`)
+stacked_bar_df <- melted_rel_ab_df %>%
+  mutate_if(is.factor, as.character) %>%
+  mutate(taxa = ifelse(taxa %not in% top_taxa, "Other", taxa)) %>%
+  group_by(soma_sample_id, sample, taxa, x) %>%
+  summarise(rel_ab = sum(rel_ab)) %>%
+  arrange(taxa) %>% ungroup() %>%
+  mutate(soma_sample_id <- factor(soma_sample_id, levels = dendrogram_labels$soma_sample_id, labels = dendrogram_labels$soma_sample_id))
+taxa_order <- c("Other", top_taxa)
+id_order <- dendrogram_labels$soma_sample_id
+stacked_bar_df$taxa <- factor(stacked_bar_df$taxa, levels = taxa_order, labels = taxa_order)
+stacked_bar_df$soma_sample_id <- factor(stacked_bar_df$soma_sample_id, levels = id_order, labels = id_order)
+
+# Palette
+pal <- c("gray80", 
+  "#A82B20", "#C95D63", "#496DDB", "#EE8434", "#330F0A", "#AE8799", "#394F49", "#65743A",
+  "#717EC3", "#F4FDAF", "#FFAA01", "#75B9BE", "#BBBCFC", "deeppink", "seagreen3", "#B5FFE1",
+  "goldenrod", "slategray1", "#DB2B39")
+
+# Bar chart
+stacked_bar_plot <- stacked_bar_df %>%
+  ggplot(aes(x = reorder(soma_sample_id, x), y = rel_ab)) +
+  geom_bar(aes(fill = taxa), position="stack", stat="identity") +
+  scale_fill_manual(values = pal) +
+  labs(x = "", y = "") +
+  scale_x_discrete(labels = dendrogram_labels$label) +
+  guides(fill = guide_legend(title = element_blank(), ncol = 4)) +
+  theme_bw() +
+  theme(
+    plot.title = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 7),
+    legend.margin = ggplot2::margin(t = -20),
+    legend.box = "vertical",
+    legend.spacing.y = unit(1, "cm"),
+    axis.text.x = element_text(angle = 90),
+    axis.text.y = element_blank(), 
+    axis.ticks = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank())
+
+dendrogram_plot <- ggplot(segment(dendrogram)) + 
+  geom_segment(aes(x = x, y = y, xend = xend, yend = yend)) +
+  scale_x_continuous(limits = c(0, 33), expand = c(0.015, 0)) +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(), 
+    axis.ticks = element_blank(),
+    panel.grid = element_blank())
+
+ggarrange(dendrogram_plot, stacked_bar_plot, ncol = 1, heights = c(1, 4))
+```
+
+# Table One
+```{r}
+# Create table to make table 1 from
+table1_data <- inclusion_data %>%
+  mutate_at(vars(psa_muc:burk), as.numeric) %>%
+  mutate(
+    pseudo_aer = psa_muc + psa_nonmuc,
+    staph_aur = staph + mrsa,
+    achromobacter = axylos + achromo) %>%
+  mutate(bmi = weight / ((height * 0.01)^2)) %>%
+  dplyr::select(
+    sid, soma_sample_id, time, sid_first, ex_num, gender, genotype, age, bmi, pe_pastyr, 
+    hosp_pastyr, admit_novirus, negative, pseudo_aer, staph_aur, 
+    achromobacter, hflu, smalto, burk, pe_pastyr, fev1_pred, pes_total) %>%
+  mutate(
+    pseudo_aer = ifelse(is.na(pseudo_aer), NA, ifelse(pseudo_aer == 0, 0, 1)),
+    pseudo_aer = as.numeric(ifelse(negative == 1, 0, pseudo_aer)),
+    staph_aur = ifelse(is.na(staph_aur), NA, ifelse(staph_aur == 0, 0, 1)),
+    staph_aur = as.numeric(ifelse(negative == 1, 0, staph_aur)),
+    achromobacter = ifelse(is.na(achromobacter), NA, ifelse(achromobacter == 0, 0, 1)),
+    achromobacter = as.numeric(ifelse(negative == 1, 0, achromobacter)),
+    hflu = as.numeric(ifelse(negative == 1, 0, ifelse(hflu == "NO RESULTS", NA, hflu))),
+    smalto = as.numeric(ifelse(negative == 1, 0, ifelse(smalto == "NO RESULTS", NA, smalto))),
+    burk = as.numeric(ifelse(negative == 1, 0, burk)),
+    admit_novirus = ifelse(admit_novirus == "NOT DONE", NA, admit_novirus),
+    negative = ifelse(negative == "NO RESULTS", NA, negative)) %>%
+  mutate(
+    admit_virus = factor(admit_novirus, levels = c(0, 1), labels = c(1, 0)),
+    gender = factor(gender, levels = c(1, 2), labels = c("Male", "Female")),
+    genotype = factor(genotype, levels = c(0:2), labels = c("0 F508del", "1 F508del", "2 F508del"))) %>%
+  arrange(sid_first, sid, time) %>%
+  filter(soma_sample_id %in% c(microbiome_data %>% pull(soma_sample_id))) %>%
+  merge(pes_df, all.x = T, all.y = F) %>%
+  dplyr::select(
+    time, sid_first, soma_sample_id, gender, genotype, age, bmi, fev1_pred, pes_total, 
+    pes_delta, pes_perc_change, pseudo_aer, staph_aur, hflu, smalto, burk, admit_virus) %>%
+  mutate(pes_geq_5 = ifelse(pes_total >= 5, 1, 0))
+
+`%not in%` <- Negate(`%in%`)
+table1_data_top <- table1_data %>% 
+  filter(soma_sample_id %not in% c("S821-254", "S821-237", "S821-272", "S821-276")) %>%
+  dplyr::select(sid_first, gender, genotype, age, bmi)
+
+vars <- c("gender", "age", "bmi", "genotype")
+cat_vars <- c("gender", "genotype")
+row_order <- c(
+  "n", "Female (%)", "Age (Years)", "Body Mass Index", "CF Mutations", "0 F508del (%)",
+  "1 F508del (%)", "2 F508del (%)")
+
+table1_top <- CreateTableOne(vars = vars, factorVars = cat_vars, data = table1_data_top) 
+table1_top <- print(table1_top, print = F, nonnormal = T, minMax = T) %>% 
+  as.data.frame() %>%
+  set_rownames(row_order) %>%
+  rownames_to_column("row.names") %>%
+  arrange(match(row.names, row_order)) %>%
+  column_to_rownames("row.names") %>%
+  mutate(Overall = str_replace(Overall, "[)]", "%)")) %>%
+  dplyr::select("Cohort Subjects" = Overall) %>%
+  kbl(booktabs = TRUE, align = "c") %>%
+  #kable_styling(latex_options = c("scale_down", "hold_position")) %>%
+  kable_classic_2(full_width = F, html_font = "Arial") %>%
+  add_indent(c(6:8))
+table1_top
+
+# Create table one
+vars <- c(
+  "fev1_pred", "pes_total", "pes_geq_5", "pes_perc_change", "pseudo_aer", "staph_aur", 
+  "hflu", "smalto", "burk", "admit_virus")
+cat_vars <- c("pes_geq_5", "pseudo_aer", "staph_aur", "hflu", "smalto", "burk", "admit_virus")
+row_order <- c(
+  "n", "FEV-1% Predicted at Admission", "PEx Score at Admission", "PExS \u2265 5 at Admission", 
+  "%ΔPExS", "CF Bacteria Culture (% Positive)", "Pseudomonas aeruginosa", "Staphylococcus aureus", 
+  "Haemophilus", "Stenotrophomonas", "Burkholderia", "Viral Infection")
+table1_bot <- CreateTableOne(vars = vars, factorVars = cat_vars, data = table1_data) 
+table1_bot <- print(table1_bot, print = F, nonnormal = T, minMax = T) %>% 
+  as.data.frame() %>%
+  set_rownames(c(
+    "n", "FEV-1% Predicted at Admission", "PEx Score at Admission", "PExS \u2265 5 at Admission", 
+    "%ΔPExS", "Pseudomonas aeruginosa", "Staphylococcus aureus", 
+    "Haemophilus", "Stenotrophomonas", "Burkholderia", "Viral Infection (%)")) %>%
+  rbind("CF Bacteria Culture (% Positive)" = c("")) %>%
+  rownames_to_column("row.names") %>%
+  arrange(match(row.names, row_order)) %>%
+  column_to_rownames("row.names") %>%
+  mutate(Overall = str_replace(Overall, "[)]", "%)")) %>%
+  dplyr::select("Study Cohort" = Overall) %>%
+  kbl(booktabs = TRUE, align = "c") %>%
+  #kable_styling(latex_options = c("scale_down", "hold_position")) %>%
+  kable_classic_2(full_width = F, html_font = "Arial") %>%
+  add_indent(c(7:11))
+table1_bot
+```
+
+# Phenotype Distribution
+## %ΔPExS
+```{r}
+# Plotting Phenotype Distribution
+phenotype_distplot <- data.frame("pes_perc_change" = y2) %>%
+  ggplot(aes(x = pes_perc_change)) +
+  geom_histogram(binwidth = 20, color = "white", fill = "gray20") +
+  geom_segment(aes(x = -90, xend = -110, y = 17.3, yend = 17.3), arrow = arrow(length = unit(0.3, "cm")), linewidth = 2, color = "#6aaa96") + 
+  geom_segment(aes(x = -70, xend = -90, y = 17.3, yend = 17.3), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#a1c6b9") + 
+  geom_segment(aes(x = -50, xend = -70, y = 17.3, yend = 17.3), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#d6e2de") + 
+  geom_segment(aes(x = -30, xend = -50, y = 17.3, yend = 17.3), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#f5d1d2") + 
+  geom_segment(aes(x = -10, xend = -30, y = 17.3, yend = 17.3), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#f39096") + 
+  geom_segment(aes(x = 10, xend = -10, y = 17.3, yend = 17.3), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#e6445f") + 
+  annotate("text", x = -50, y = 19, label = expression(paste(italic("Increasing Response to Treatment")))) + 
+  scale_y_continuous(name = "Number of Subjects (n)", limits = c(0, 20), breaks = c(0, 5, 10, 15, 20)) +
+  scale_x_continuous(name = "%ΔPExS", breaks = seq(-120, 20, by = 20)) +
+  theme_bw() + 
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 11),
+    axis.title = element_text(size = 14))
+phenotype_distplot
+ggsave("figures-and-tables/PExS_perc_delta/phenotype-distribution.perc_delta.png", width = 7, height = 3)
+```
+
+## ΔPExS
+```{r}
+phenotype_distplot <- data.frame("pes_delta" = y) %>%
+  ggplot(aes(x = pes_delta)) +
+  geom_histogram(binwidth = 3, color = "white", fill = "gray20") +
+  geom_segment(aes(x = -13.5, xend = -16.5, y = 13.2, yend = 13.2), arrow = arrow(length = unit(0.3, "cm")), linewidth = 2, color = "#6aaa96") + 
+  geom_segment(aes(x = -10.5, xend = -13.5, y = 13.2, yend = 13.2), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#a1c6b9") + 
+  geom_segment(aes(x = -7.5, xend = -10.5, y = 13.2, yend = 13.2), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#d6e2de") + 
+  geom_segment(aes(x = -4.5, xend = -7.5, y = 13.2, yend = 13.2), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#f5d1d2") + 
+  geom_segment(aes(x = -1.5, xend = -4.5, y = 13.2, yend = 13.2), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#f39096") + 
+  geom_segment(aes(x = 1.5, xend = -1.5, y = 13.2, yend = 13.2), arrow = arrow(length = unit(0, "cm")), linewidth = 2, color = "#e6445f") + 
+  annotate("text", x = -7.5, y = 14.5, label = expression(paste(italic("Increasing Response to Treatment")))) + 
+  scale_y_continuous(name = "Number of Subjects (n)", limits = c(0, 15), breaks = c(0, 5, 10, 15)) +
+  scale_x_continuous(name = "ΔPExS", breaks = seq(-15, 1.5, by = 3)) +
+  theme_bw() + 
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 11),
+    axis.title = element_text(size = 14))
+  
+phenotype_distplot
+ggsave("figures-and-tables/PExS_delta/phenotype-distribution.delta.png", width = 7, height = 3)
+```
+
+# Relationship Between the Outcomes and PExS at Enrollment
+```{r}
+# Make new data frame accounting for repeat subjects
+id_counts <- table(table1_data %>% pull(sid_first))
+repeated_ids <- names(id_counts[id_counts == 2])
+table1_w_repeat_info_df <- table1_data %>% 
+  mutate(sample = ifelse(sid_first %in% repeated_ids, paste0("SID-", sid_first), "-"))
+
+# Plot
+## Annotation data
+corr_perc_delta <- cor(table1_w_repeat_info_df$pes_perc_change, table1_w_repeat_info_df$pes_total)
+corr_delta <- cor(table1_w_repeat_info_df$pes_delta, table1_w_repeat_info_df$pes_total)
+annotation_data <- data.frame(
+  "label" = c(paste0("rho = ", round(corr_perc_delta, 2)), paste0("rho = ", round(corr_delta, 2))),
+  "outcome" = c("%ΔPExS", "ΔPExS"))
+
+## Decision plot
+phenotype_decision_plot <- rbind(
+  data.frame(
+    "outcome" = "%ΔPExS",
+    "pes_admission" = table1_w_repeat_info_df$pes_total,
+    "outcome_value" = table1_w_repeat_info_df$pes_perc_change,
+    "sample" = table1_w_repeat_info_df$sample),
+  data.frame(
+    "outcome" = "ΔPExS",
+    "pes_admission" = table1_w_repeat_info_df$pes_total,
+    "outcome_value" = table1_w_repeat_info_df$pes_delta,
+    "sample" = table1_w_repeat_info_df$sample)) %>%
+  ggplot(aes(x = pes_admission, y = outcome_value)) +
+  geom_jitter(aes(color = sample), size = 3, width = 0.5, alpha = 0.8) +
+  geom_text(
+    data = annotation_data,
+    mapping = aes(x = 13.6, y = 0, label = label), hjust = -0.3, vjust = 1) +
+  facet_wrap(. ~ outcome, scales = "free_y") +
+  labs(x = "PEx Score at Admission", y = "Outcome Value", color = "Repeated Subjects") +
+  scale_x_continuous(limits = c(7, 17), breaks = seq(8, 17, by = 2)) +
+  scale_color_manual(values = c("black", "#F9CB40", "#80FF72", "#7EE8FA", "#F78764")) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 11))
+
+## Save plot
+phenotype_decision_plot
+ggsave("figures-and-tables/pes_admission_corr_w_outcome.png", width = 7, height = 3)
+```
+
+# Correlation Analysis
+## %ΔPExS
+```{r}
+# Proteomics and phenotype correlations
+x1y_cor <- cor(x1, y2) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("rho")) %>% 
+  mutate(corr_comparison = "proteomics-phenotype") %>%
+  dplyr::select(corr_comparison, rho)
+
+# Microbiome and phenotype correlations
+x2y_cor <- cor(x2, y2) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("rho")) %>% 
+  mutate(corr_comparison = "microbiome-phenotype") %>%
+  dplyr::select(corr_comparison, rho)
+
+# Microbiome and proteomics correlations
+x1x2_cor <- cor(x1, x2) %>% 
+  as.data.frame() %>% 
+  melt(value.name = "rho") %>% 
+  mutate(corr_comparison = "between-omics") %>% 
+  dplyr::select(corr_comparison, rho)
+
+# Full data frame for plotting
+cor_mat <- rbind(x1y_cor, x2y_cor, x1x2_cor) %>%
+  mutate(corr_comparison = factor(
+    corr_comparison, 
+    levels = c("between-omics", "microbiome-phenotype", "proteomics-phenotype"),
+    labels = c(bquote("Protein—Taxon"), "Taxon—%ΔPExS", "Protein—%ΔPExS")))
+
+# Violin/box plot
+between_set_corr_plot <- ggplot(cor_mat, aes(x = corr_comparison, y = rho)) +
+  geom_violin(aes(fill = corr_comparison, color = corr_comparison), show.legend = F, width = 0.5) +
+  geom_boxplot(width = 0.07, color = "black", fill = "black", outlier.colour = "black", outlier.alpha = 0.2) +
+  scale_fill_manual(values = c("#C96464", "#FFD468", "#6B9AC1")) +
+  scale_color_manual(values = c("#AB5555", "#FFC83E", "#50799A")) +
+  scale_y_continuous(limits = c(-0.8, 0.8), breaks = seq(-0.8, 0.8, 0.4)) +
+  labs(x = "", y = "Pearson Correlation") +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 11),
+    axis.title = element_text(size = 14))
+
+# Change median color
+boxplot <- ggplot(cor_mat, aes(x = corr_comparison, y = rho)) + geom_boxplot(width = 0.07)
+boxplot_data <- ggplot_build(boxplot)$data[[1]]
+between_set_corr_plot <- between_set_corr_plot + 
+  geom_segment(
+    data = boxplot_data, aes(x = xmin, xend = xmax, y = middle, yend = middle), 
+    color = "white", linewidth = 1)
+
+between_set_corr_plot
+ggsave("figures-and-tables/PExS_perc_delta/between-dataset-corr-plot.perc_delta.png", width = 7, height = 3)
+```
+
+## ΔPExS
+```{r}
+# Proteomics and phenotype correlations
+x1y_cor <- cor(x1, y) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("rho")) %>% 
+  mutate(corr_comparison = "proteomics-phenotype") %>%
+  dplyr::select(corr_comparison, rho)
+
+# Microbiome and phenotype correlations
+x2y_cor <- cor(x2, y) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("rho")) %>% 
+  mutate(corr_comparison = "microbiome-phenotype") %>%
+  dplyr::select(corr_comparison, rho)
+
+# Microbiome and proteomics correlations
+x1x2_cor <- cor(x1, x2) %>% 
+  as.data.frame() %>% 
+  melt(value.name = "rho") %>% 
+  mutate(corr_comparison = "between-omics") %>% 
+  dplyr::select(corr_comparison, rho)
+
+# Full data frame for plotting
+cor_mat <- rbind(x1y_cor, x2y_cor, x1x2_cor) %>%
+  mutate(corr_comparison = factor(
+    corr_comparison, 
+    levels = c("between-omics", "microbiome-phenotype", "proteomics-phenotype"),
+    labels = c(bquote("Protein—Taxon"), "Taxon—%ΔPExS", "Protein—%ΔPExS")))
+
+# Violin/box plot
+between_set_corr_plot <- ggplot(cor_mat, aes(x = corr_comparison, y = rho)) +
+  geom_violin(aes(fill = corr_comparison, color = corr_comparison), show.legend = F, width = 0.5) +
+  geom_boxplot(width = 0.07, color = "black", fill = "black", outlier.colour = "black", outlier.alpha = 0.2) +
+  scale_fill_manual(values = c("#C96464", "#FFD468", "#6B9AC1")) +
+  scale_color_manual(values = c("#AB5555", "#FFC83E", "#50799A")) +
+  scale_y_continuous(limits = c(-0.8, 0.8), breaks = seq(-0.8, 0.8, 0.4)) +
+  labs(x = "", y = "Pearson Correlation") +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 11),
+    axis.title = element_text(size = 14))
+
+# Change median color
+boxplot <- ggplot(cor_mat, aes(x = corr_comparison, y = rho)) + geom_boxplot(width = 0.07)
+boxplot_data <- ggplot_build(boxplot)$data[[1]]
+between_set_corr_plot <- between_set_corr_plot + 
+  geom_segment(
+    data = boxplot_data, aes(x = xmin, xend = xmax, y = middle, yend = middle), 
+    color = "white", linewidth = 1)
+
+between_set_corr_plot
+ggsave("figures-and-tables/PExS_delta/between-dataset-corr-plot.delta.png", width = 7, height = 3)
+```
+

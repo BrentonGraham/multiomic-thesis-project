@@ -1,7 +1,7 @@
 ---
-title: "SmCCNet: Jackknifing"
+title: 'SmCCNet: Sensitivity Analysis'
 author: "Brenton Graham"
-date: "2023-05-21"
+date: "2023-06-05"
 output: html_document
 ---
 
@@ -19,22 +19,64 @@ require(Matrix)
 source("r-functions/network-summarization-function.R")
 ```
 
+
+
+
+
+
 # Import Data
 ```{r, message = FALSE}
-# Import omics sets and outcome
-X1 <- read_delim("./data/x1.microbiome_set.csv", delim = ",")
-X2 <- read_delim("./data/x2.proteomics_set.csv", delim = ",")
+# Set data ---------------------------------------------------------------------
+X1 <- read_delim("./data/x1.proteomics_set.csv", delim = ",")
+X2 <- read_delim("./data/x2.microbiome_set.csv", delim = ",")
 Y <- read_delim("./data/y.delta_pes.csv", delim = ",")
 
 # Import CV selected penalization parameters (optimal lambda pair)
-cv_file <- "./results/SmCCNet-5FoldCV-Unweighted-PES/TotalPredictionError.csv"
+cv_file <- "./results/SmCCNet-5FoldCV-Weighted-1-2-2-PES/TotalPredictionError.csv"
 cv_results <- read.table(cv_file, sep = ",", header = T)
 pen <- which(cv_results$cc_pred_error == min(cv_results$cc_pred_error))
 l1 <- cv_results$l1[pen]; l2 <- cv_results$l2[pen]
+s1 <- 0.7; s2 <- 0.9 # Feature sampling proportions
 
 # Create jackknife directory
 jackknife_dir <- "./results/SmCCNet-Jackknife-PES/"
 dir.create(jackknife_dir, showWarnings = F)
+```
+
+# Example SmCCNet
+```{r}
+# Remove first sample
+X1_jk <- X1[c(-2), ]
+X2_jk <- X2[c(-2), ]
+Y_jk <- Y[c(-2), ]
+
+# Get canonical correlation weight matrix
+weights <- getRobustPseudoWeights(
+  X1_jk, X2_jk, Y_jk, l1, l2, s1, s2, CCcoef = c(1, 2, 2),
+  NoTrait = FALSE, FilterByTrait = FALSE, SubsamplingNum = 500)
+
+# Set label names; sub() shortens taxa names
+abar_label <-  sub('.*\\/', '', colnames(cbind(X1_jk, X2_jk)))
+
+# Compute adjacency/similarity matrix based on outer products of abs(weights)
+abar <- SmCCNet::getAbar(weights, P1 = ncol(X1_jk), abar_label)
+
+# Get omics modules
+modules <- getMultiOmicsModules(abar, ncol(X1_jk))
+
+# Get correlation matrix
+big_cor <- cor(cbind(X1_jk, X2_jk))
+
+# Get taxa
+taxa <- c()
+for (m in 1:length(modules)) {
+  subnetwork_ind <- modules[[m]]
+  subnetwork_abar <- as.matrix(abar[subnetwork_ind, subnetwork_ind])
+  subnet_taxa <- subnetwork_abar %>% as.data.frame() %>% dplyr::select(-contains("seq")) %>% colnames()
+  taxa <- c(taxa, subnet_taxa)
+}
+
+taxa
 ```
 
 # Perform Jackknifed SmCCNet
@@ -53,12 +95,13 @@ get_iter_number <- function(str) {
 # Files present in output dir
 jk_files <- list.files(jackknife_smccnet_dir)
 first_iter <- max(unlist(lapply(jk_files, get_iter_number))) + 1
+first_iter <- ifelse(first_iter == -Inf, 1, first_iter)
 
 # Iterate through data set removing one sample at a time and performing SmCCNet
 for (i in seq(first_iter, nrow(Y))){
   
   # Message
-  cat(paste0("Testing removal of sample ", i, "/", nrow(Y), "..."))
+  cat(paste0("\nTesting removal of sample ", i, "/", nrow(Y), "...\n"))
   
   # Remove sample
   X1_jk <- X1[c(-i), ]
@@ -67,7 +110,8 @@ for (i in seq(first_iter, nrow(Y))){
   
   # Get canonical correlation weight matrix
   weights <- getRobustPseudoWeights(
-    X1_jk, X2_jk, Y_jk, l1, l2, NoTrait = FALSE, FilterByTrait = FALSE, SubsamplingNum = 500)
+    X1_jk, X2_jk, Y_jk, l1, l2, s1, s2, CCcoef = c(1, 2, 2),
+    NoTrait = FALSE, FilterByTrait = FALSE, SubsamplingNum = 500)
   
   # Set label names; sub() shortens taxa names
   abar_label <-  sub('.*\\/', '', colnames(cbind(X1_jk, X2_jk)))
@@ -92,7 +136,7 @@ for (i in seq(first_iter, nrow(Y))){
 ```{r}
 # Prune subnetworks ------------------------------------------------------------
 # Make subdir
-jackknife_subnet_dir <- paste0(jackknife_dir, "subnetwork-summarization-nofilter")
+jackknife_subnet_dir <- paste0(jackknife_dir, "subnetwork-summarization")
 dir.create(jackknife_subnet_dir, showWarnings = F)
 
 # Iterate through resamples
@@ -128,14 +172,13 @@ for (i in 1:nrow(Y)) {
       # Labeling omics types
       P1 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(-contains("seq")))
       P2 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(contains("seq")))
-      types <- c(rep('taxa', P1), rep('protein', P2))
+      types <- c(rep('protein', P1), rep('taxa', P2))
       
       # Prune subnetwork
-      Network_Summarization_PPR_single_nofilter(
+      Network_Summarization_PPR_trim(
         Abar = subnetwork_abar, CorrMatrix = subnetwork_corr, type = types, 
-        Pheno = Y_jk %>% pull(), data = subnetwork_data, ModuleIdx = m, 
-        min_mod_size = 3, max_mod_size = 500, method = 'NetSHy', 
-        saving_dir = subnetwork_dir)
+        Pheno = Y_jk %>% pull(), data = subnetwork_data, ModuleIdx = i, 
+        max_mod_size = 2500, method = 'PCA', saving_dir = subnetwork_dir)
     }
   }
   # Print new empty line to separate resamples
@@ -202,12 +245,10 @@ for (i in 1:nrow(Y)) {
     }
   }
   
-  # Filter out subnetworks with no correlation to phenotype (enforce rho > 0.2)
-  taxa_phenotype_correlation_df <- subnetwork_taxa_summary %>%
-    rownames_to_column(var = "taxa")
-  
   # Append all resampling results to a similar df
-  jk_subnetwork_taxa_summary <- rbind(jk_subnetwork_taxa_summary, taxa_phenotype_correlation_df)
+  jk_subnetwork_taxa_summary <- rbind(
+    jk_subnetwork_taxa_summary, 
+    subnetwork_taxa_summary %>% rownames_to_column(var = "taxa"))
 }
 ```
 
@@ -457,7 +498,6 @@ as.matrix(abar[modules[[mod]], modules[[mod]]])
 
 analyte_df %>% pull(UniProt) %>% unique() %>% length()
 ```
-
 
 
 

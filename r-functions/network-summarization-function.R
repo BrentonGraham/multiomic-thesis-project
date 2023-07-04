@@ -123,16 +123,16 @@ Network_Summarization_PPR_trim <- function(
   
   # Correlations between PC scores and phenotype
   pc_correlation <- cor(pca_score_df[, 1:3], pca_score_df[,4])
-  summary_correlation <- c(summary_correlation, pc_correlation[1])
   subnet_corr <- CorrMatrix[newM.node, newM.node]
+  pca_importance <- summary_result$importance
   
   # Report subnetwork information
   cat(paste0('The final network size is: ', nrow(M), ' with PC1 correlation w.r.t. phenotype to be: ', round(pc_correlation[1], 3), '\n'))
   
   # Save objects in Rdata file
   save(
-    M, pca_score_df, pc_loading, pc_correlation, omics_correlation_data, 
-    summary_correlation, subnet_corr, file = paste0(saving_dir, "/subnetwork_", ModuleIdx, ".Rdata"))
+    M, pca_score_df, pc_correlation, pc_loading, omics_correlation_data, subnet_corr, 
+    pca_importance, file = paste0(saving_dir, "/subnetwork_", ModuleIdx, ".Rdata"))
 }
 
 

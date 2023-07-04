@@ -5,13 +5,17 @@ date: "2023-06-02"
 output: html_document
 ---
 
+
+# The Phenotype
+$$
+\%\Delta\mathrm{PExS} = \frac{\mathrm{PExS}_{t_2} - \mathrm{PExS}_{t_1}}{\mathrm{PExS}_{t_1}} \times 100\%
+$$
+
 # CCA
 $$
 (w_1, w_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}\:\mathrm{Cor}(X_1\tilde{w}_1,X_2\tilde{w}_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}\:\tilde{w}_1^TX_1^TX_2\tilde{w}_2
 
 \\ \mathrm{subject\:to}\: \tilde{w}_1^TX_1^TX_1\tilde{w}_1 = \tilde{w}_2^TX_2^TX_2\tilde{w}_2 = 1
-
-\\ (1)
 $$
 
 # SmCCA

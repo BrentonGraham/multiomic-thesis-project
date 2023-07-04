@@ -1,0 +1,343 @@
+---
+title: "Integrating airway microbiome and plasma proteomics data to identify multi-omic networks associated with cystic fibrosis pulmonary exacerbation treatment response"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  beamer:
+    theme: Warsaw
+    colortheme: CU
+    incremental: false # set to false for handout version
+    header-includes: |
+      \AtBeginDocument{\author[MS Biostatistics Thesis Paper]{Brenton Graham}}
+      \useoutertheme[subsection=false]{smoothbars}
+      \usepackage{wasysym}
+      \usepackage{graphics}
+      \usepackage{amsmath,amssymb}
+      \usepackage[english]{babel} 
+      \expandafter\def\expandafter\insertshorttitle\expandafter{%
+      \insertframenumber\,/\,\inserttotalframenumber}
+    institute: |
+      | Department of Biostatistics and Informatics
+      | University of Colorado Anschutz Medical Campus
+      |
+      | Committee: Laura Saba (PhD), Brandie Wagner (PhD), Jonathan K Harris (PhD)
+    section-titles: false
+    slide-level: 3
+    urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Introduction
+
+### Cystic Fibrosis
+- Cystic fibrosis (CF) is a chronic, genetic disease that causes the body to produce abnormally thick mucus
+
+- People with CF are at high risk of chronic bacterial infections, inflammation, and progressive respiratory complications
+
+- ~40,000 children and adults have been diagnosed with CF in the United States
+
+### Pulmonary Exacerbations
+- Pulmonary exacerbations (PExs) are the leading cause of morbidity in CF
+
+- PExs are significant life events associated with...
+  - Acute decrease in lung function
+  - Reduced quality of life (QOL)
+  - Shortened survival
+  
+- Lung function is often not fully recovered despite seemingly appropriate therapies (e.g., targeted IV antibiotic treatment)
+
+### Airway Microbiome & Blood Proteome in CF
+- Inflammatory biomarkers in both the airway and blood have been shown to decrease after treatment of a PEx
+
+- Evidence suggests that airway infection in CF results in a robust host immune response
+
+- Identifying associations between specific airway bacteria or bacterial communities and host-response may be critical to understanding the pathogenicity of CF bacteria
+
+### The Thesis
+- **Goal:** To identify multiomic (taxon—protein) networks at PEx onset that are indicative of PEx recovery
+
+- We use an extension of canonical correlation analysis (CCA) called sparse multiple canonical correlation network (SmCCNet) for data integration (Shi et al., Kechris Lab)
+
+- We hope to provide insights into the **variability observed in PEx recovery**
+
+# Study & Data Description
+### Study Design & Population
+- 33 PEx events from a cohort of 29 subjects aged 10 to 22
+
+- Participants could be reenrolled if PEx events were separated by $\geq6$ months
+  - 25 subjects with one PEx event
+  - 4 subjects with two PEx events
+
+- Participants were recruited prospectively and enrolled at the time of hospital admission for IV antibiotic therapy of a clinically diagnosed PEx
+
+- IV antibiotics were targeted for specific CF pathogens as determined through microbial culture
+
+### Study Design & Population
+- The study focuses on two time points
+\vspace{0.2cm}
+  - Hospital admission (i.e., PEx onset, day 0-2)
+  - Hospital discharge (i.e., After IV treatment, day 4-21)
+
+\vspace{0.3cm}
+- Study procedures at each visit included
+\vspace{0.2cm}
+  - A physical
+  - A spirometry test
+  - **A standardized PEx score**
+  - A validated QOL measure
+  - Specimen collection (**blood** and **sputum** samples)
+
+### The Phenotype: $\%\Delta\mathrm{PExS}$
+- The phenotype of interest is % change in PEx score (PExS) between hospital admission ($t_1$) and discharge ($t_2$), $\%\Delta\mathrm{PExS}$
+\vspace{0.3cm}
+\begin{center}
+$\%\Delta\mathrm{PExS} = \frac{\mathrm{PExS}_{t_2} - \mathrm{PExS}_{t_1}}{\mathrm{PExS}_{t_1}} \times 100\%$  
+\end{center}
+\vspace{0.3cm}
+- PEx score (PExS) is a standardized score that considers
+\vspace{0.2cm}
+  - Patient symptoms (2 week change in exercise tolerance, cough, sputum production, chest congestion, school/work attendance, appetite)
+  \vspace{0.2cm}
+  - Physical examination findings (increased adventitial sounds on auscultation of the chest, change in $\mathrm{FEV}_1$)
+
+### The Phenotype: $\%\Delta\mathrm{PExS}$
+- $\%\Delta\mathrm{PExS}$ as a clinical measure of PEx recovery
+\vspace{0.3cm}
+```{r echo=FALSE, out.width='90%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/phenotype-distribution.perc_delta.png')
+```
+
+### Study Design
+- The predictors ($X_1$ and $X_2$) are measured at PEx onset
+
+- The outcome, $Y$, is a longitudinal measure
+
+```{r echo=FALSE, out.width='100%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/data-description-figure.png')
+```
+
+### Study Demographics
+```{r echo=FALSE, out.width='60%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/table1.png')
+```
+
+### Airway Samples, Sequencing & Sequence Analysis
+- Spontaneously expectorated **sputum** was used for airway microbiome analysis; sputum induction was performed for participants unable to spontaneously expectorate
+
+- Amplicons were generated using primers targeting approximately 300 base pairs of the V1/V2 variable region of the 16S rRNA gene
+
+- Illumina paired-end sequencing was performed on the MiSeq platform using a 500 cycle v2 reagent kit
+
+- Assembled sequences were aligned and classified with SINA (1.2.11) using the Silva 111 database as reference
+
+### Airway Microbiome Data Preprocessing
+- Microbiome data were filtered to include only prevalent taxa
+  - **Detection Threshold**: 0.1% Relative Abundance (RA)
+  - **Prevalence Threshold**: 10% of Samples
+  - *Taxa must exceed 0.1% RA in $\geq$ 10% of samples*
+
+- Count data were transformed using the centered log-ratio (CLR) transformation given by
+\vspace{0.3cm}
+\begin{center} 
+$clr(x) = ln\:x_i - \frac{1}{D}\sum_{j=1}^{D}ln\:x_j$ 
+\end{center}
+\vspace{0.3cm}
+where $D$ represents the number of components (or taxa)
+
+- A pseudocount of $\mathrm{RA}_{min}/2$ was applied to exact zero RA entries before CLR transformation
+
+### Blood Proteomics Assay & Data Preprocessing
+- Blood samples were sent to SomaLogic for proteomics analysis 
+
+- Proteomics data were measured using the SomaScan multiplex proteomics assay, an aptamer-based assay measuring ~3.6k unique proteins
+
+- RFU values were transformed using a log$_2$-transformation
+
+- All data were standardized prior to statistical analysis
+
+# Statistical Methods
+### Canonical Correlation Analysis (CCA)
+- CCA aims to find the linear combination of variables that maximizes the correlation (i.e., canonical correlation) between two multivariate data sets (e.g., $X_1$, $X_2$)
+
+- Canonical weights $w_1$ and $w_2$ are defined as
+\vspace{0.5cm}
+\begin{center} 
+$(w_1, w_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}\mathrm{Cor}(X_1\tilde{w}_1,X_2\tilde{w}_2)$ 
+\end{center}
+\vspace{0.5cm}
+where $\mathrm{\:Cor}(X_1\tilde{w}_1,X_2\tilde{w}_2)$ denotes the canonical correlation between $X_1$ and $X_2$ and $\mathrm{\:Cor}(X_1\tilde{w}_1,X_2\tilde{w}_2) = \tilde{w}_1^TX_1^TX_2\tilde{w}_2$, subject to $\tilde{w}_1^TX_1^TX_1\tilde{w}_1 = \tilde{w}_2^TX_2^TX_2\tilde{w}_2 = 1$
+
+### Sparse Multiple CCA (SmCCA)
+- SmCCA incorporates a third data type (i.e, the phenotype $Y$) into the integration task by accounting for phenotype—omic correlation within the canonical weight objective function
+
+- The definition of $(w_1, w_2)$ becomes
+\vspace{0.5cm}
+\begin{center}
+\small{
+$(w_1, w_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}(a\tilde{w}_1^TX_1^TX_2\tilde{w}_2 + b\tilde{w}_1^TX_1^TY + c\tilde{w}_2^TX_2^TY)$}
+\end{center}
+\vspace{0.5cm}
+where $a$, $b$, and $c$ are scaling constants that can be used to used to prioritize correlations with the phenotype (i.e., taxon—$\%\Delta$PExS or protein—$\%\Delta$PExS correlation)
+
+### Sparse Multiple CCA (SmCCA)
+- Sparsity is imposed on the canonical weights $(w_1, w_2)$ since not all features contribute to the true canonical correlation
+
+- $w_1$ and $w_2$ in SmCCA are subject to
+\vspace{0.5cm}
+\begin{center}
+$||\tilde{w}_s||^2 = 1,\: P_s(\tilde{w}_s) \leq c_s,\: s = 1, 2$
+\end{center}
+\vspace{0.5cm}
+where $P(\cdot)$ represent penalty functions (e.g., the LASSO) and $c_s$ represent pre-specified sparse penalty constants
+
+### SmCCNet Workflow
+```{r echo=FALSE, out.width='70%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/SmCCNetWorkflow.png')
+```
+
+### Hyperparameter Tuning: Sparse Penalty Selection
+- We used 5-fold cross-validation (CV) and a randomized grid search approach to select the optimal penalty pair
+
+- The selected penalty pair corresponds to the pair that minimizes the prediction error between training and test sets
+
+- Counterintuitively, increasing the value of a penalty parameter weakens the strength of regularization
+
+- We searched a range of larger values for the $X_1$ penalty parameter (0.4 to 0.6) and a range of smaller values for the $X_2$ penalty parameter (0.1 to 0.3) due to feature imbalance between $X_1$ (60 taxa) and $X_2$ (4,001 aptamers)
+
+- We used feature subsampling proportions of 0.90 and 0.70 for $X_1$ and $X_2$ to further account for dimensionality imbalance
+
+### Hyperparameter Tuning: SmCCA Weighting Scheme
+- We explored the *weighted* version of SmCCNet (the case where $a$, $b$, and $c$ are not equal) since correlations between taxon—protein were stronger than correlations between taxon—$\%\Delta$PExS and protein—$\%\Delta$PExS
+
+```{r echo=FALSE, out.width='100%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/between-dataset-corr-plot.perc_delta.png')
+```
+
+### Hyperparameter Tuning: SmCCA Weighting Scheme
+- Remember the SmCCA canonical weight objective function
+\vspace{0.15cm}
+\begin{center}
+\small{
+$(w_1, w_2) = \mathrm{arg}\:\max_{\tilde{w}_1,\tilde{w}_2}(a\tilde{w}_1^TX_1^TX_2\tilde{w}_2 + b\tilde{w}_1^TX_1^TY + c\tilde{w}_2^TX_2^TY)$}
+\end{center}
+\vspace{0.25cm}
+
+- We tried various ($a$, $b$, $c$) weighting schemes to test the effect of increasing taxon—phenotype correlation importance ($b$)
+
+- Tested ($a$, $b$, $c$): (1, 1, 1), (1, 2, 1), (1, 5, 1)
+
+- Optimal weighting scheme was determined by considering:
+  - Subnetwork—phenotype correlation strength
+  - Subnetwork size (i.e., number of nodes)
+  - Taxon—protein balance
+
+### Network Summarization
+- Principal component analysis (PCA) was used for subnetwork summarization
+
+- We used the correlation between subnetwork-specific PC1s and $\%\Delta\mathrm{PExS}$ to measure subnetwork-phenotype association
+
+- Absolute subnetwork—phenotype correlations are reported as the use of PC1 obscures the interpretability of $+$/$-$ relationships
+
+- Defining *strong* associations as $|\rho| > 0.3$
+
+### Subnetwork Pruning
+- We aimed to incorporate a rational/systematic process to limit subnetwork sizes to 325 nodes (<10% of the feature space)
+
+- The thought was to limit the number of proteins in a large subnetwork to ~300 proteins
+
+- The pruning process aims to trim the least important nodes in a given subnetwork
+\vspace{0.3cm}
+
+#### **The Pruning Process for Large Subnetworks (>325 Nodes)**
+1. Rank nodes by *importance* using the PageRank algorithm
+\vspace{0.3cm}
+2. Select the top 325 ranked nodes
+
+### Subnetwork Visualization
+- **Edge Pruning**
+
+  - Weak node-to-node connections (edges) can blur biologically relevant relationships in subnetwork visualizations 
+
+  - Edges were removed (i.e., set to 0) if between node correlations were weak ($\rho < 0.2$)
+
+- **GO-Specific Subnetwork Visualization**
+
+  - Large subnetwork visualization is difficult due to the number of nodes, edges, and subnetwork attributes
+  
+  - We selected one GO pathway per subnetwork to visualize
+  
+  - Network visualizations include the proteins contained within the selected GO pathway and subnetwork-specific taxa
+  
+### GO Enrichment Analysis
+- **Metascape** was used for GO enrichment analysis using subnetwork-specific protein sets
+
+  - $P$-value threshold: 0.001
+  
+  - Enrichment threshold: 3
+  
+  - Minimum protein threshold: 3
+  
+  - The full set of unique proteins targeted by the assay was used as the background list
+
+# Results
+### Identified SmCCNet Networks
+```{r echo=FALSE, out.width='90%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/plot1.perc_delta.png')
+```
+
+### GO Enrichment Results
+```{r echo=FALSE, out.width='90%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/GO_barplot.png')
+```
+
+### Subnetwork 2: GO:0042100
+```{r echo=FALSE, out.width='75%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network_2_summary_tbl.png')
+```
+\vspace{0.3cm}
+```{r echo=FALSE, out.width='70%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network2-GO-B-cell-proliferation.png')
+```
+
+- Include canonical weight distribution
+
+### Subnetwork 2: GO:1903587
+```{r echo=FALSE, out.width='75%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network_2_summary_tbl.png')
+```
+\vspace{0.3cm}
+```{r echo=FALSE, out.width='70%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network2-GO-angiogenesis.png')
+```
+
+### Subnetwork 4: GO:2000328
+```{r echo=FALSE, out.width='75%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network_4_summary_tbl.png')
+```
+
+```{r echo=FALSE, out.width='75%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network4-GO-T-helper-17.png')
+```
+
+### Subnetwork 5: GO:0051092
+```{r echo=FALSE, out.width='75%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network_5_summary_tbl.png')
+```
+\vspace{0.3cm}
+```{r echo=FALSE, out.width='70%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network5-GO-NF-kappaB.png')
+```
+
+### Subnetwork 6
+```{r echo=FALSE, out.width='75%', fig.align='center'}
+knitr::include_graphics('../figures-and-tables/PExS_perc_delta/network_6_summary_tbl.png')
+```
+
+# Discussion
+### Discussion Point 1
+
+### Discussion Point 2
+
+

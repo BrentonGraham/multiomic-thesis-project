@@ -1,0 +1,541 @@
+---
+title: "SmCCNet: Hyperparameter Tuning with Cross-Validation"
+author: "Brenton Graham"
+date: "2023-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(phyloseq)
+require(microbiome)
+require(ade4)
+require(PMA)
+require(vegan)
+require(ggrepel)
+require(scales)
+require(ggpubr)
+require(SmCCNet)
+require(Matrix)
+require(compositions)
+source("r-functions/network-summarization-function.R")
+require(kableExtra)
+```
+
+# K-Fold Cross-Validation
+```{r}
+# Set data ---------------------------------------------------------------------
+X1 <- read_delim("./data/x1.proteomics_set.csv", delim = ",")
+X2 <- read_delim("./data/x2.microbiome_set.csv", delim = ",")
+Y <- read_delim("./data/y.pes_perc_change.csv", delim = ",")
+
+# Denote the number of features
+p1 <- ncol(X1)
+p2 <- ncol(X2)
+n <- nrow(X1)
+AbarLabel <- c(colnames(cbind(X1, X2)))
+AbarLabel <- sub('.*\\/', '', AbarLabel) # Shorten taxa names to lowest line
+
+# CV ---------------------------------------------------------------------------
+K <- 5                  # Number of folds in K-fold CV
+#CCcoef <- NULL          # Unweighted version of SmCCNet
+#CCcoef <- c(1, 1, 2)    # Weighted version of SmCCNet - Increased weight on omic/phenotype
+CCcoef <- c(1, 1, 5)    # Weighted version of SmCCNet - Increased weight on omic/phenotype
+s1 <- 0.7; s2 <- 0.9    # Feature sampling proportions
+SubsamplingNum <- 10    # num_subsamples - decrease this to reduce computational time
+
+# Random grid search approach
+## Create sparsity penalty grid
+pen1 <- seq(0.10, 0.30, by = 0.05)
+pen2 <- seq(0.40, 0.60, by = 0.05)
+P1P2 <- expand.grid(pen1, pen2)
+
+## Shuffle grid and randomly select 10 pairs
+set.seed(1) # For reproducibility
+shuffle <- sample(nrow(P1P2))
+P1P2 <- P1P2[shuffle, ] %>% head(10)
+
+# Set a CV directory
+#cv_dir <- "./results/SmCCNet-5FoldCV-percPES-Unweighted/"
+#cv_dir <- "./results/SmCCNet-5FoldCV-percPES-Weighted-1-1-2/"
+cv_dir <- "./results/SmCCNet-5FoldCV-percPES-Weighted-1-1-5/"
+dir.create(cv_dir)
+
+# Create test and training sets
+set.seed(0)
+foldIdx <- split(1:n, sample(1:n, K))
+for(i in 1:K){
+  iIdx <- foldIdx[[i]]
+  x1.train <- scale(X1[-iIdx, ])
+  x2.train <- scale(X2[-iIdx, ])
+  yy.train <- scale(Y[-iIdx, ])
+  x1.test <- scale(X1[iIdx, ])
+  x2.test <- scale(X2[iIdx, ])
+  yy.test <- scale(Y[iIdx, ])
+
+  # Check if standardized data sets are valid.
+  if(is.na(min(min(x1.train), min(x2.train), min(yy.train), min(x1.test), min(x2.test), min(yy.test)))) {
+    stop("Invalid scaled data. At least one of the data matrices include a column with zero variance.")}
+  subD <- paste0(cv_dir, "CV_", i, "/")
+  dir.create(subD)
+  save(x1.train, x2.train, yy.train, x1.test, x2.test, yy.test,
+       s1, s2, P1P2, p1, p2, SubsamplingNum, CCcoef,
+       file = paste0(subD, "Data.RData"))
+}
+
+library(parallel)
+cl <- makeCluster(K, type = "FORK") # Create K parallel threads.
+clusterExport(cl = cl, "cv_dir")     # Pass on variable cv_dir to each thread.
+parSapply(cl, 1:K, function(CVidx){
+
+  # Reload source code files for each thread
+  # NOTE: Must download SmCCNet package from https://github.com/KechrisLab/SmCCNet
+  # and keep the package in the working directory
+  source("SmCCNet/R/ModifiedPMA.R")
+  source("SmCCNet/R/SmCCNetSource.R")
+
+  # Create a result directory for each thread.
+  subD <- paste0(cv_dir, "CV_", CVidx, "/")
+  load(paste0(subD, "Data.RData"))
+  dir.create(paste0(subD, "SmCCA/"))
+
+  RhoTrain <- RhoTest <- DeltaCor <- n_nonzero_u <- n_nonzero_v <- rep(0, nrow(P1P2))
+  for(idx in 1:nrow(P1P2)){
+
+      # Consider one pair of sparsity penalties at a time.
+      l1 <- P1P2[idx, 1]
+      l2 <- P1P2[idx, 2]
+
+      # Run SmCCA on the subsamples (Figure 1, Step II)
+      Ws <- getRobustPseudoWeights(
+        x1.train, x2.train, yy.train, l1, l2, s1, s2,
+        NoTrait = FALSE, FilterByTrait = FALSE,
+        SubsamplingNum = SubsamplingNum, CCcoef = CCcoef)
+
+      # Aggregate pseudo-canonical weights from the subsamples
+      meanW <- rowMeans(Ws)
+      u <- meanW[1:p1]
+      v <- meanW[p1 + 1:p2]
+
+      # Compute the prediction error for given CV fold and sparsity penalties
+      if(is.null(CCcoef)){CCcoef <- rep(1, 3)} # Unweighted SmCCA.
+      rho.train <- cor(x1.train %*% u, x2.train %*% v) * CCcoef[1] +
+          cor(x1.train %*% u, yy.train) * CCcoef[2] +
+          cor(x2.train %*% v, yy.train) * CCcoef[3]
+      rho.test <- cor(x1.test %*% u, x2.test %*% v) * CCcoef[1] +
+          cor(x1.test %*% u, yy.test) * CCcoef[2] +
+          cor(x2.test %*% v, yy.test) * CCcoef[3]
+      RhoTrain[idx] <- round(rho.train, digits = 5)
+      RhoTest[idx] <- round(rho.test, digits = 5)
+      DeltaCor[idx] <- abs(rho.train - rho.test)
+      n_nonzero_v[idx] <- Matrix::nnzero(v)
+      n_nonzero_u[idx] <- Matrix::nnzero(u)
+
+      # Save results in a temporary file
+      save(P1P2, RhoTrain, RhoTest, DeltaCor, n_nonzero_u, n_nonzero_v, idx,
+           file = paste0(subD, "temp.RData"))
+    }
+
+  # Record prediction errors for given CV fold and all sparsity penalty
+  # options
+  DeltaCor.all <- cbind(P1P2, RhoTrain, RhoTest, DeltaCor, n_nonzero_u, n_nonzero_v)
+  colnames(DeltaCor.all) <- c("l1", "l2", "cc_train", "cc_test", "cc_pred_error", "n_nonzero_u", "n_nonzero_v")
+  write.csv(DeltaCor.all, file = paste0(subD, "SmCCA/PredictionError.csv"))
+
+  # Remove the temporary file.
+  system(paste0("rm ", subD, "temp.RData"))
+  return(CVidx)
+  })
+
+# Close cluster
+stopCluster(cl)
+
+# Combine prediction errors from all K folds and compute the total prediction
+# error for each sparsity penalty pair.
+testCC <- predError <- NULL
+for(j in 1:K){
+    resultT <- paste0(cv_dir, "CV_", j, "/SmCCA/PredictionError.csv")
+    dCorT <- read.csv(resultT)[ , -1]
+    testCC <- cbind(testCC, abs(dCorT[ , 4]))
+    predError <- cbind(predError, dCorT[ , 5])
+}
+    
+S1 <- rowMeans(testCC)
+S2 <- rowMeans(predError)
+T12 <- dCorT[ , -3]; T12[ , 3] <- S1; T12[ , 4] <- S2
+write.csv(T12, file = paste0(cv_dir, "TotalPredictionError.csv"))
+
+cv_results <- read.table(paste0(cv_dir, "TotalPredictionError.csv"), sep = ",", header = T)
+
+# Contour plot -----------------------------------------------------------------
+library(plotly)
+library(reshape2)
+f1 <- list(family = "Arial, sans-serif", size = 20, color = "black")
+f2 <- list(family = "Arial, sans-serif", size = 20, color = "black")
+a <- list(title = "l1", titlefont = f1, showticklabels = TRUE, tickfont = f2)
+b <- list(title = "l2", titlefont = f1, showticklabels = TRUE, tickfont = f2)
+hmelt <- melt(cv_results %>% dplyr::select(l1, l2, cc_pred_error), id.vars = c("l1", "l2"))
+contourPlot <- plot_ly(hmelt, x = ~l1, y = ~l2, z = ~value, type = "contour") %>%
+  layout(xaxis = a, yaxis = b, showlegend = TRUE, legend = f1)
+show(contourPlot)
+
+# Select "optimal" lambda pair -------------------------------------------------
+pen <- which(cv_results$cc_pred_error == min(cv_results$cc_pred_error))
+l1 <- cv_results$l1[pen]; l2 <- cv_results$l2[pen]
+cat(paste0("Optimal penalty pair (l1, l2): (", l1, ", ", l2, ")"))
+```
+
+# Integration with SmCCNet
+```{r}
+# Integrate two omics data types and a quantitative phenotype ------------------
+## Get canonical correlation weight matrix
+weights <- getRobustPseudoWeights(
+  scale(X1), scale(X2), scale(Y), l1, l2, s1, s2, 
+  NoTrait = FALSE, FilterByTrait = FALSE, SubsamplingNum = 500, CCcoef = CCcoef)
+
+## Set label names; sub() shortens taxa names
+abar_label <-  sub('.*\\/', '', colnames(cbind(X1, X2)))
+
+## Compute adjacency/similarity matrix based on outer products of abs(weights)
+abar <- SmCCNet::getAbar(weights, P1 = ncol(X1), abar_label)
+
+## Get omics modules
+modules <- getMultiOmicsModules(abar, ncol(X1), CutHeight = 1 - 0.1^10)
+
+## Get correlation matrix
+big_cor <- cor(cbind(X1, X2))
+
+## Save objects
+save(
+  x1 = X1, x2 = X2, y = Y, 
+  weights = weights, 
+  abar_label = abar_label, 
+  abar = abar, 
+  modules = modules, 
+  big_cor = big_cor, 
+  file = paste0(cv_dir, "/scaled-R-objects.Rdata"))
+```
+
+# Network Summarization
+```{r}
+# Summarize subnetworks --------------------------------------------------------
+# Create directory to store subnetwork files
+subnets_dir <- paste0(cv_dir, "subnetworks/")
+dir.create(subnets_dir)
+
+for (i in 1:length(modules)){
+  
+  cat(paste0("\nWorking on module ", i, "...\n"))
+  
+  # Extract subnetwork specific inputs (adjacency matrix, correlation matrix, data)
+  subnetwork_ind <- modules[[i]]
+  subnetwork_abar <- as.matrix(abar[subnetwork_ind, subnetwork_ind])
+  subnetwork_corr <- as.matrix(big_cor)[subnetwork_ind, subnetwork_ind]
+  subnetwork_data <- as.matrix(cbind(X1, X2) %>% set_colnames(abar_label))[, subnetwork_ind]
+  
+  # Skip module if too few nodes
+  if (nrow(subnetwork_abar) < 3) {
+    cat("Too few nodes (less than 3)... Skipping module.")
+  }
+  
+  # Else proceed with pruning
+  else {
+    # Labeling omics types
+    P1 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(-contains("seq")))
+    P2 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(contains("seq")))
+    types <- c(rep('taxa', P1), rep('protein', P2))
+    
+    # Prune subnetwork
+    Network_Summarization_PPR_trim(
+      Abar = subnetwork_abar, CorrMatrix = subnetwork_corr, type = types, 
+      Pheno = Y %>% pull(), data = subnetwork_data, ModuleIdx = i, max_mod_size = 1000, 
+      method = 'PCA', saving_dir = subnets_dir)
+  }
+}
+```
+
+# Taxa in Each Network
+```{r}
+# Summarize subnetwork correlations with PES (taxa only) -----------------------
+cv_dir <- "./results/SmCCNet-5FoldCV-percPES-Weighted-1-1-2/"
+load(paste0(cv_dir, "scaled-R-objects.Rdata"))
+
+# Empty data frame to concatenate results
+subnetwork_taxa_summary <- data.frame()
+
+# Iterate through each subnetwork (module) and add correlation info to subnetwork_taxa_summary
+for (mod in c(1:length(modules))) {
+  
+  # Load subnetwork-specific objects
+  load(paste0(cv_dir, "subnetworks/subnetwork_", mod, ".Rdata"))
+  
+  # Correlation of each taxon in module with the outcome
+  correlation_data <- omics_correlation_data %>%
+    filter(substr(name, 1, 3) != 'seq') %>% # Focus on taxa (remove proteins)
+    dplyr::select(correlation, p) %>%
+    round(3)
+  
+  # Correlation of PC1 to phenotype
+  correlation_data$subnetwork <- mod
+  correlation_data$subnet_corr_with_y <- abs(as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3)))
+  correlation_data$subnet_corr_with_y_p <- round(cor.test(pca_score_df[, 1], pca_score_df[, 4])$p.value, 3)
+  
+  # n Nodes
+  n_nodes <- nrow(omics_correlation_data)
+  correlation_data$n_nodes <- n_nodes
+  
+  # Append subnetwork-specific results
+  subnetwork_taxa_summary <- rbind(subnetwork_taxa_summary, correlation_data)
+}
+
+# View table
+subnetwork_taxa_summary %>% knitr::kable()
+```
+
+# Scaling Constant Comparison
+```{r}
+# CV directories to iterate through
+cv_dirs <- c(
+  "./results/SmCCNet-5FoldCV-percPES-Unweighted/", 
+  "./results/SmCCNet-5FoldCV-percPES-Weighted-1-1-2/",
+  "./results/SmCCNet-5FoldCV-percPES-Weighted-1-1-5/")
+
+# Scaling constants matching each CV dir
+scaling_constants <- c("(1, 1, 1)", "(1, 2, 1)", "(1, 5, 1)")
+
+# Empty data frame to concatenate results
+subnetwork_summary <- data.frame()
+
+# Iterate through CVs with varying scaling constants
+for (i in seq(1, length(cv_dirs))) {
+
+  # Load CV specific objects
+  load(paste0(cv_dirs[i], "scaled-R-objects.Rdata"))
+  
+  # Iterate through each subnetwork (module) and add correlation info to subnetwork_taxa_summary
+  for (m in seq(1, length(modules))) {
+    
+    # Load subnetwork-specific objects
+    load(paste0(cv_dirs[i], "subnetworks/subnetwork_", m, ".Rdata"))
+    
+    # Get node info
+    subnetwork_nodes <- colnames(subnet_corr)
+    subnetwork_prots <- as.data.frame(subnet_corr) %>% dplyr::select(contains("seq")) %>% colnames()
+    subnetwork_taxa <- as.data.frame(subnet_corr) %>% dplyr::select(-contains("seq")) %>% colnames()
+    
+    # Correlation of PC1 to phenotype
+    correlation_df <- data.frame(
+      #"smccnet_version" = smccnet_version[i], 
+      "scaling_constants" = scaling_constants[i],
+      "subnetwork" = m, 
+      "subnet_corr" = as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3)), 
+      "subnet_corr_p" = round(cor.test(pca_score_df[, 1], pca_score_df[, 4])$p.value, 3), 
+      "var_exp" = round(pca_importance[2, 1], 3),
+      "n_taxa" = length(subnetwork_taxa), 
+      "n_protein" = length(subnetwork_prots), 
+      "n_nodes" = length(subnetwork_nodes))
+    
+    # Append subnetwork-specific results
+    subnetwork_summary <- rbind(subnetwork_summary, correlation_df)
+  }
+}
+
+# Edit corr (p-value) format within table
+subnetwork_summary <- subnetwork_summary %>%
+  mutate(subnet_corr_p = case_when(
+    subnet_corr_p < 0.01 ~ "<0.01*",
+    (subnet_corr_p >= 0.01) & (subnet_corr_p <= 0.05) ~ paste0(subnet_corr_p, "*"),
+    subnet_corr_p > 0.05 ~ paste0(subnet_corr_p))) %>%
+  mutate(subnet_corr = paste0(abs(subnet_corr), " (", subnet_corr_p, ")")) %>%
+  dplyr::select(-subnet_corr_p)
+
+# Create kable table for manuscript
+col.names = c("Scaling Weights\n(a, b, c)", "Network", "Pheno Corr\n(P-Value)", "PC1 Var Exp", "Taxa", "Proteins", "Nodes")
+supp_table1 <- kbl(subnetwork_summary, booktabs = TRUE, align = "c", col.names = col.names) %>%
+  collapse_rows(c(1, 2), valign = "middle") %>%
+  row_spec(c(1:10, 21:28), background = "#EDEDED") %>%
+  kable_styling(font_size = 20) 
+show(supp_table1)
+
+# Save table
+supp_table1 %>% save_kable(file = "figures-and-tables/PExS_perc_delta/supp_table_1.perc_delta.png", zoom = 0.75)
+```
+
+# Network Summaries and Pruning Subnetwork 1
+```{r}
+# # Prune subnetwork 1 -----------------------------------------------------------
+# # Load CV objects
+# load(paste0(cv_dir, "scaled-R-objects.Rdata"))
+# 
+# # Extract subnetwork specific inputs (adjacency matrix, correlation matrix, data)
+# mod <- 2
+# subnetwork_ind <- modules[[mod]]
+# subnetwork_abar <- as.matrix(abar[subnetwork_ind, subnetwork_ind])
+# subnetwork_corr <- as.matrix(big_cor)[subnetwork_ind, subnetwork_ind]
+# subnetwork_data <- as.matrix(cbind(X1, X2) %>% set_colnames(abar_label))[, subnetwork_ind]
+# P1 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(-contains("seq")))
+# P2 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(contains("seq")))
+# types <- c(rep('protein', P1), rep('taxa', P2))
+# 
+# # Rank node importance using PageRank
+# # Build graph from subnetwork similarity matrix (abar, adjacency matrix)
+# net_ppr <- igraph::graph_from_adjacency_matrix(subnetwork_abar, weighted = TRUE, diag = FALSE, mode = "undirected")
+# igraph::set_vertex_attr(net_ppr, "type", index = igraph::V(net_ppr), as.factor(types))
+# 
+# # Get rankings
+# ranking <- igraph::page_rank(
+#   net_ppr, directed = FALSE, damping = 0.9, options = list(niter = 10^5, eps = 1e-06))
+# 
+# # Obtain ranked names
+# rank_names <- names(sort(ranking$vector, decreasing = TRUE))
+# rank_value <- sort(ranking$vector, decreasing = TRUE)
+# 
+# # Determine correlation between subnetwork PC1 and phenotype for top 100-200 ranked nodes
+# top_k_nodes <- seq(100, nrow(subnetwork_abar))
+# top_k_subnet_corrs <- rep(0, length(top_k_nodes))
+# top_k_var_explained <- rep(0, length(top_k_nodes))
+# for (k in 1:length(top_k_nodes)) {
+#   
+#   # Extract data frame of top k ranked nodes (M)
+#   data_topk_subset <- subnetwork_data[, which(colnames(subnetwork_abar) %in% rank_names[1:top_k_nodes[k]])]
+#   
+#   # Run PCA, extract the PC1 score and add to df with phenotype
+#   pca_summary <- prcomp(data_topk_subset)
+#   pca_score_df <- data.frame(pc1 = pca_summary$x[,1], y = Y %>% pull())
+#   
+#   # Get correlation between PC1 and phenotype
+#   pc_correlation <- cor(pca_score_df$pc1, pca_score_df$y)
+#   var_explained <- summary(pca_summary)$importance[2, 1]
+#   
+#   # Append results
+#   top_k_subnet_corrs[k] <- pc_correlation
+#   top_k_var_explained[k] <- var_explained
+# }
+# 
+# # Display data frame of results
+# topk_df <- data.frame(
+#   "top_k_nodes" = top_k_nodes, 
+#   "subnetwork_corr" = abs(top_k_subnet_corrs), 
+#   "var_explained" = top_k_var_explained)
+# 
+# # Extract optimal value for k (# nodes with max corr)
+# optimal_k <- topk_df %>% 
+#   filter(subnetwork_corr == max(topk_df$subnetwork_corr)) %>% 
+#   pull(top_k_nodes)
+# 
+# # Summarize subnetworks --------------------------------------------------------
+# 
+# # Create directory to store subnetwork files
+# pruned_subnets_dir <- paste0(cv_dir, "pruned-subnetworks/")
+# dir.create(pruned_subnets_dir)
+# 
+# # Iterate through selected subnetworks to get network summaries
+# # Subnetwork 1 will be trimmed to top k nodes
+# for (mod in c(2)){
+#   
+#   cat(paste0("\nWorking on module ", mod, "...\n"))
+#   
+#   # Extract subnetwork specific inputs (adjacency matrix, correlation matrix, data)
+#   subnetwork_ind <- modules[[mod]]
+#   subnetwork_abar <- as.matrix(abar[subnetwork_ind, subnetwork_ind])
+#   subnetwork_corr <- as.matrix(big_cor)[subnetwork_ind, subnetwork_ind]
+#   subnetwork_data <- as.matrix(cbind(X1, X2) %>% set_colnames(abar_label))[, subnetwork_ind]
+#   
+#   # Skip module if too few nodes
+#   if (nrow(subnetwork_abar) < 3) {
+#     cat("Too few nodes (less than 3)... Skipping module.")
+#   }
+#   
+#   # Else proceed with pruning
+#   else {
+#     
+#     # Labeling omics types
+#     P1 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(-contains("seq")))
+#     P2 <- ncol(subnetwork_data %>% as.data.frame() %>% dplyr::select(contains("seq")))
+#     types <- c(rep('taxa', P1), rep('protein', P2))
+#     
+#     # Prune subnetwork - Optimal k will work for all since modules 3 and 5 have less than 176 nodes
+#     Network_Summarization_PPR_trim(
+#       Abar = subnetwork_abar, CorrMatrix = subnetwork_corr, type = types, 
+#       Pheno = Y %>% pull(), data = subnetwork_data, ModuleIdx = mod, max_mod_size = optimal_k, 
+#       method = 'PCA', saving_dir = pruned_subnets_dir)
+#   }
+# }
+```
+
+# Visualize Network Pruning for Subnetwork 1
+```{r}
+# # Visualize line plot of Network 1 corr with phenotype when including top k nodes
+# network_pruning_viz <- ggplot(topk_df, aes(x = top_k_nodes, y = subnetwork_corr)) +
+#   geom_line(lwd = 0.8) +
+#   geom_vline(aes(xintercept = optimal_k), color = "blue", linetype = 2, lwd = 0.8) + 
+#   geom_vline(aes(xintercept = max(top_k_nodes)), color = "#EC4E20", linetype = 2, lwd = 0.8) + 
+#   labs(x = expression(paste("Top ", italic("k"), " Ranked Nodes Included (Ranked by PageRank)")), y = "Network Correlation with ΔPExS") + 
+#   annotate("text", x = 115, y = 0.43, label = expression(paste(italic("k"), " = 159 Nodes"))) + 
+#   annotate("text", x = 310, y = 0.435, label = paste0("Original ", max(top_k_nodes), " Nodes")) + 
+#   geom_segment(aes(x = 140, y = 0.43, xend = 155, yend = 0.43), arrow = arrow(length = unit(0.1, "cm"))) + 
+#   geom_segment(aes(x = 345, y = 0.435, xend = 360, yend = 0.435), arrow = arrow(length = unit(0.1, "cm"))) + 
+#   theme_bw() + 
+#   theme(panel.grid.minor = element_blank())
+# 
+# # Show and save plot
+# show(network_pruning_viz)
+# ggsave("figures-and-tables/network1_pruning_viz.png", width = 7, height = 3)
+```
+
+# Selected Subnetwork Summaries
+```{r}
+# # Empty df to store results
+# subnetwork_summary <- data.frame()
+# 
+# # Iterate through each subnetwork (module) and add correlation info to subnetwork_taxa_summary
+# for (mod in c(1, 3)) {
+#   
+#   # Load subnetwork-specific objects
+#   load(paste0(cv_dir, "pruned-subnetworks/subnetwork_", mod, ".Rdata"))
+#   
+#   # Get node info
+#   subnetwork_nodes <- colnames(subnet_corr)
+#   subnetwork_prots <- as.data.frame(subnet_corr) %>% dplyr::select(contains("seq")) %>% colnames()
+#   subnetwork_taxa <- as.data.frame(subnet_corr) %>% dplyr::select(-contains("seq")) %>% colnames()
+#   
+#   # Correlation of PC1 to phenotype
+#   correlation_df <- data.frame(
+#     "scaling_constants" = "(1, 2, 2)",
+#     "subnetwork" = mod, 
+#     "subnet_corr" = abs(as.numeric(round(cor(pca_score_df[, 1], pca_score_df[, 4]), 3))), 
+#     "subnet_corr_p" = round(cor.test(pca_score_df[, 1], pca_score_df[, 4])$p.value, 3), 
+#     "n_taxa" = length(subnetwork_taxa), 
+#     "n_protein" = length(subnetwork_prots), 
+#     "n_nodes" = length(subnetwork_nodes))
+#   
+#   # Append subnetwork-specific results
+#   subnetwork_summary <- rbind(subnetwork_summary, correlation_df)
+# }
+# 
+# # Edit corr (p-value) format within table
+# subnetwork_summary <- subnetwork_summary %>%
+#   mutate(subnet_corr_p = case_when(
+#     subnet_corr_p < 0.01 ~ "<0.01*",
+#     (subnet_corr_p >= 0.01) & (subnet_corr_p <= 0.05) ~ paste0(subnet_corr_p, "*"),
+#     subnet_corr_p > 0.05 ~ paste0(subnet_corr_p))) %>%
+#   mutate(subnet_corr = paste0(abs(subnet_corr), " (", subnet_corr_p, ")")) %>%
+#   dplyr::select(-subnet_corr_p)
+# 
+# # Create kable table for manuscript
+# col.names = c("Scaling Weights\n(a, b, c)", "Network", "Phenotype Correlation\n(P-Value)", "Taxa", "Proteins", "Nodes")
+# selected_network_table <- kbl(subnetwork_summary, booktabs = TRUE, align = "c", col.names = col.names) %>%
+#   collapse_rows(c(1, 2), valign = "middle") %>%
+#   kable_styling(font_size = 20) 
+# show(selected_network_table)
+# 
+# # Save table
+# selected_network_table %>% save_kable(file = "figures-and-tables/selected_network_table.png", zoom = 2)
+```
+

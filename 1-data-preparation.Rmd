@@ -1,0 +1,132 @@
+---
+title: "SmCCNet: Data Preprocessing"
+author: "Brenton Graham"
+date: "2023-05-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(tidyverse)
+require(magrittr)
+require(readr)
+require(tableone)
+require(knitr)
+require(phyloseq)
+require(microbiome)
+require(ade4)
+require(PMA)
+require(vegan)
+require(scales)
+require(ggpubr)
+require(SmCCNet)
+require(Matrix)
+require(compositions)
+require(reshape2)
+```
+
+# Data Preparation
+```{r, message = F}
+# Full set mutliomics set
+data <- "/Users/bgraham/Research/883/Data/Merged Data/883MergedData.20221026.csv" %>% read_delim(delim = ",")
+
+# Not in function
+`%not in%` <- Negate(`%in%`)
+
+# Select appropriate data for study
+inclusion_data <- data %>% 
+  filter(sid > 25) %>%                    # SIDs > 25
+  filter(sample_type_16S == "Sputum") %>% # Select samples with sputum sequencing data
+  filter(!is.na(proteomics_batch)) %>%    # Select samples with both microbiome/proteome data
+  filter(time != 3) %>%                   # Remove follow-up data
+  # Label T1 and T2 vars
+  mutate(time = factor(time, levels = c(1, 2), labels = c("T1", "T2"))) %>%
+  # Remove proteomics dupes
+  unite("id_and_prot_batch", c(soma_sample_id, proteomics_batch), sep = "_", remove = F) %>%
+  filter(id_and_prot_batch %not in% c("S821-364_20170126", "S821-323_20170126", "S821-276_20170126"))
+
+# Get all FEV-1 data for T1 and T2 and calculate pes_delta (fev1_pred_T2 - fev1_pred_T1)
+pes_df <- data %>% 
+  filter(sid > 25) %>% 
+  filter(time != 3) %>% # Inclusion criteria
+  dplyr::select(sid, time, pes_total) %>%    # Select columns needed for calculation
+  unique() %>%                               # Drop repeat rows (FEV same for sputum/saliva samples)
+  mutate(time = factor(time, levels = c(1, 2), labels = c("pes_T1", "pes_T2"))) %>%
+  pivot_wider(names_from = time, values_from = pes_total) %>%
+  mutate(pes_delta = pes_T2 - pes_T1) %>%
+  mutate(pes_perc_change = (100*(pes_T2 - pes_T1)/pes_T1))
+
+# Merge outcome into data frame
+inclusion_data <- merge(inclusion_data, pes_df, all.x = T, all.y = F) %>%
+  relocate(c("pes_delta", "pes_T1", "pes_T2"), .after = pes_total) %>%
+  filter(pes_T1 > 5) # Filter out individual not meeting PEx criteria
+
+# Microbiome data
+microbiome_data <- inclusion_data %>% 
+  filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(soma_sample_id, contains("Bacteria/"), -contains("other"))
+
+# Proteomics data
+proteomics_data <- inclusion_data %>% 
+  filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(soma_sample_id, contains("seq"))
+
+# Check that samples are matched up
+if (identical(proteomics_data$soma_sample_id, microbiome_data$soma_sample_id)) {
+  cat("Sample IDs of proteomics_data and microbiome_data match.\n")
+} else {cat("Sample IDs DO NOT MATCH!\n")}
+
+# CLR transformation of microbiome data
+otu_table <- microbiome_data %>% column_to_rownames("soma_sample_id") %>% t() %>% otu_table(taxa_are_rows=T)
+metadata <- inclusion_data %>% filter(time == "T1") %>% filter(!is.na(pes_delta)) %>% 
+  dplyr::select(-contains("Bacteria"), -contains("seq")) %>%
+  mutate(rownames = soma_sample_id) %>% 
+  column_to_rownames("rownames")
+otu_names <- otu_table %>% as.data.frame() %>% rownames()
+tax_levels <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+otu_tax_split <- sapply(otu_names, FUN=function(x) strsplit(x, "/"))
+tax_table <- plyr::ldply(otu_tax_split, rbind)[-1] %>%
+  set_rownames(otu_names) %>%
+  set_colnames(tax_levels) %>%
+  as.matrix()
+physeq <- phyloseq(otu_table(otu_table), tax_table(tax_table), sample_data(metadata))
+phseq.ra <- physeq %>% microbiome::transform("compositional")
+physeq.filtered <- phseq.ra %>% microbiome::core(detection = 1e-3, prevalence = 10/100)
+microb_clr_data <- physeq.filtered %>% microbiome::transform("clr") %>% abundances() %>% t() %>% as.data.frame()
+
+# Ready modalities and outcome for output
+x1 <- proteomics_data %>% column_to_rownames("soma_sample_id") %>% log2() %>% as.matrix()
+x2 <- microb_clr_data %>% as.matrix()
+x2_ra <- phseq.ra %>% abundances() %>% t() %>% as.data.frame()
+x2_ra_filtered <- physeq.filtered %>% abundances() %>% t() %>% as.data.frame()
+y <- sample_data(physeq.filtered) %>% as.data.frame() %>% pull(pes_delta) %>% as.matrix()
+y2 <- sample_data(physeq.filtered) %>% as.data.frame() %>% pull(pes_perc_change) %>% as.matrix()
+
+# Shuffle rows
+set.seed(1) # For reproducibility
+shuffle <- sample(nrow(y))
+x1 <- x1[shuffle, ]
+x2 <- x2[shuffle, ]
+x2_ra <- x2_ra[shuffle, ]
+x2_ra_filtered <- x2_ra_filtered[shuffle, ]
+y <- y[shuffle, ]
+y2 <- y2[shuffle, ]
+sample_data <- physeq.filtered %>% sample_data()
+sample_data <- sample_data[shuffle, ]
+
+# Check that shuffled sample IDs match
+if (all(sapply(list(rownames(x1), rownames(x2), rownames(x2_ra)), FUN = identical, rownames(sample_data)))) {
+  cat("Shuffled IDs match.\n")
+} else {cat("Shuffled sample IDs DO NOT MATCH!\n")}
+
+# Output processed data files
+x1 %>% write.table("./data/x1.proteomics_set.csv", sep = ",", row.names = F)
+x2 %>% write.table("./data/x2.microbiome_set.csv", sep = ",", row.names = F)
+x2_ra %>% write.table("./data/x2_relab.microbiome_set.csv", sep = ",", row.names = F)
+x2_ra_filtered %>% write.table("./data/x2_relab_filtered.microbiome_set.csv", sep = ",", row.names = F)
+y %>% write.table("./data/y.delta_pes.csv", sep = ",", row.names = F)
+y2 %>% write.table("./data/y.pes_perc_change.csv", sep = ",", row.names = F)
+sample_data %>% write.table("./data/sample_data.csv", sep = ",", row.names = F)
+inclusion_data %>% write.table("./data/inclusion_data.csv", sep = ",", row.names = F)
+```

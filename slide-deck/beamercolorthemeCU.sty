@@ -1,0 +1,38 @@
+\mode<presentation>
+
+\definecolor{cugold}{rgb}{0.81, 0.72, 0.49} % Definition of yellow color
+
+\setbeamercolor{structure}{fg=black,bg=cugold}
+%\setbeamercolor{local structure}{parent=structure}
+
+% Main title-bar colors
+\setbeamercolor{palette primary}{fg=cugold,bg=black} % !<#> is transparency
+\setbeamercolor{palette secondary}{fg=cugold,bg=black}
+\setbeamercolor{palette tertiary}{fg=white,bg=cugold}
+\setbeamercolor{palette quaternary}{fg=white,bg=black}
+
+\setbeamercolor{titlelike}{parent=palette tertiary}
+
+% Inner block colors
+\setbeamercolor{block title}{fg=black,bg=cugold}
+\setbeamercolor{block title alerted}{use=alerted text,fg=cugold,bg=alerted text.fg!75!bg}
+\setbeamercolor{block title example}{use=example text,fg=cugold,bg=example text.fg!75!bg}
+
+\setbeamercolor{block body}{parent=normal text,use=block title,bg=block title.bg!25!bg}
+\setbeamercolor{block body alerted}{parent=normal text,use=block title alerted,bg=block title alerted.bg!25!bg}
+\setbeamercolor{block body example}{parent=normal text,use=block title example,bg=block title example.bg!25!bg}
+
+%\setbeamercolor{sidebar}{bg=cugold!70}
+%  
+%\setbeamercolor{palette sidebar primary}{fg=black}
+%\setbeamercolor{palette sidebar secondary}{fg=cugold!75}
+%\setbeamercolor{palette sidebar tertiary}{fg=cugold!75}
+%\setbeamercolor{palette sidebar quaternary}{fg=cugold}
+
+%\setbeamercolor{enumerate subitem}{fg=black}
+
+\setbeamercolor{description item}{fg=blue}
+
+
+
+\mode<all>
